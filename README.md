@@ -10,7 +10,22 @@ A bar widget for [Teamwork.com](https://www.teamwork.com) time tracking in the [
 omarchy plugin add https://github.com/tomhayes/omarchy-teamwork --enable
 ```
 
-Requires `python3` (standard library only), `notify-send`, `xdg-open`, and optionally `secret-tool` (libsecret) for keyring storage.
+Requires `python3` (standard library only), `notify-send`, `xdg-open`, and optionally `secret-tool` (libsecret) for keyring storage. All ship with Omarchy.
+
+## Remove
+
+1. In the panel's **Settings**, press **Remove** next to the API key, so it's deleted from the keyring (or run `secret-tool clear service tomhayes.teamwork account api-key`).
+2. Remove the plugin. This disables it and deletes its folder:
+
+   ```bash
+   omarchy plugin remove tomhayes.teamwork
+   ```
+
+   If its entry (with your settings) is still in `bar.layout` in `~/.config/omarchy/shell.json`, delete the `tomhayes.teamwork` object there.
+
+3. Optionally delete its cache and state: `rm -rf ~/.cache/tomhayes.teamwork ~/.local/state/tomhayes.teamwork`.
+
+The plugin writes nothing outside those two folders, the keyring entry and its own bar entry in `~/.config/omarchy/shell.json`.
 
 ## First run
 
