@@ -98,11 +98,11 @@
         "key": "refreshIntervalSec",
         "type": "integer",
         "label": "Refresh interval (seconds)",
-        "min": 15,
+        "min": 0,
         "max": 3600,
         "step": 15,
         "defaultValue": 60,
-        "description": "How often timers and time logged are fetched from Teamwork in the background."
+        "description": "How often timers and time logged are fetched from Teamwork in the background (15 to 3600). 0 turns background polling off: it then refreshes only when the panel opens and after an action, and reminders rely on the last refresh."
       },
       {
         "key": "longTimerWarnHours",

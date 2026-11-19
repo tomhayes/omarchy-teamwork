@@ -144,3 +144,37 @@ test("backs off on failure, capped", () => {
   assert.equal(M.backoffMs(5, 0), 15000)
   assert.equal(M.backoffMs(3600, 3), 3600000)
 })
+
+test("refresh interval: 0 turns polling off, else 15 s to an hour", () => {
+  assert.equal(M.refreshInterval(0), 0)
+  assert.equal(M.refreshInterval("0"), 0)
+  assert.equal(M.refreshInterval(-30), 0)
+  assert.equal(M.refreshInterval(5), 15)
+  assert.equal(M.refreshInterval(60), 60)
+  assert.equal(M.refreshInterval("120"), 120)
+  assert.equal(M.refreshInterval(99999), 3600)
+  for (const junk of [undefined, null, "", "soon", NaN, Infinity, true, {}]) assert.equal(M.refreshInterval(junk), 60, String(junk))
+})
+
+test("data freshness: bounded by the poll, unbounded with polling off", () => {
+  const hour = 3600000
+  assert.equal(M.dataFresh(true, "", 10 * hour, 10 * hour - 60000, 60), true)
+  assert.equal(M.dataFresh(true, "", 10 * hour, 10 * hour - 5 * 60000, 60), false)
+  // Polling off: the last refresh stands, however old.
+  assert.equal(M.dataFresh(true, "", 10 * hour, 1 * hour, 0), true)
+  assert.equal(M.dataFresh(true, "Teamwork error", 10 * hour, 10 * hour, 0), false)
+  assert.equal(M.dataFresh(false, "", 10 * hour, 10 * hour, 0), false)
+})
+
+test("with polling off the nag still fires from the last snapshot", () => {
+  const nowMs = 10 * 3600000
+  const fetchedMs = nowMs - 2 * 3600000 // last refreshed two hours ago
+  const s = {
+    nowMs: nowMs, phase: "working", configured: true, nagEnabled: true, hasRunningTimer: false,
+    dataFresh: M.dataFresh(true, "", nowMs, fetchedMs, M.refreshInterval(0)),
+    intervalMin: 15, lastNagMs: 0, idleSinceMs: fetchedMs, segmentStartMs: 0
+  }
+  assert.equal(M.shouldNag(s), true)
+  // With a 60 s poll the same two-hour-old snapshot is stale: no nag.
+  assert.equal(M.shouldNag(Object.assign({}, s, { dataFresh: M.dataFresh(true, "", nowMs, fetchedMs, 60) })), false)
+})

@@ -28,6 +28,13 @@ KEY = "twp_TestKey1234567890abcdef"
 ME = {"person": {"id": 123, "firstName": "Alex", "lastName": "Example"}}
 
 
+class Drip:
+    """A response body sent a few bytes at a time, `delay` seconds apart."""
+
+    def __init__(self, data, chunk=1, delay=0.2):
+        self.data, self.chunk, self.delay = data, chunk, delay
+
+
 class MockHandler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -48,7 +55,10 @@ class MockHandler(BaseHTTPRequestHandler):
             res = route(rec) if callable(route) else route
             status, payload = res[0], res[1]
             headers = res[2] if len(res) > 2 else {}
-        if isinstance(payload, (dict, list)):
+        drip = payload if isinstance(payload, Drip) else None
+        if drip:
+            data = drip.data
+        elif isinstance(payload, (dict, list)):
             data = json.dumps(payload).encode()
         elif isinstance(payload, str):
             data = payload.encode()
@@ -60,7 +70,13 @@ class MockHandler(BaseHTTPRequestHandler):
                 self.send_header(k, v)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            if self.command != "HEAD":
+            if self.command != "HEAD" and drip:
+                self.wfile.flush()
+                for i in range(0, len(data), drip.chunk):
+                    self.wfile.write(data[i:i + drip.chunk])
+                    self.wfile.flush()
+                    time.sleep(drip.delay)
+            elif self.command != "HEAD":
                 self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -210,6 +226,29 @@ class KeyTests(Base):
         self.assert_error(self.run_tw("set-key", stdin=b"has space inside"), "usage")
         self.assert_error(self.run_tw("set-key", stdin=b"x" * 5000), "usage")
         self.assert_error(self.run_tw("set-key", stdin=b"\xff\xfe"), "usage")
+        self.assertEqual(self.server.requests, [])
+
+    def test_loose_key_file_is_tightened(self):
+        self.store_key()
+        os.chmod(self.keyfile, 0o644)
+        self.assertTrue(self.run_tw("has-key", site=False)["hasKey"])
+        self.assertEqual(stat.S_IMODE(os.stat(self.keyfile).st_mode), 0o600)
+
+    def test_key_file_symlink_is_not_followed(self):
+        real = os.path.join(self.tmp, "elsewhere")
+        with open(real, "w") as f:
+            f.write(KEY + "\n")
+        os.makedirs(os.path.dirname(self.keyfile), mode=0o700)
+        os.symlink(real, self.keyfile)
+        self.assertFalse(self.run_tw("has-key", site=False)["hasKey"])
+
+    def test_key_pasted_as_argument_is_not_echoed(self):
+        for argv in (("set-key", KEY), ("start", KEY), ("complete", "1", "--billable", KEY), (KEY,),
+                     ("start", "x'" + KEY)):
+            d = self.run_tw(*argv)
+            self.assert_error(d, "usage")
+            self.assertNotIn(KEY, d["error"])
+            self.assertNotIn(KEY[4:], json.dumps(d))
         self.assertEqual(self.server.requests, [])
 
     def test_clear_key(self):
@@ -846,6 +885,51 @@ class ErrorTests(Base):
             self.server.routes[("GET", v3("me.json"))] = (200, payload)
             self.assert_error(self.run_tw("status"), "api")
 
+    def test_trickled_response_hits_the_overall_deadline(self):
+        # Each byte arrives well within the socket timeout; the call as a whole must still end.
+        self.server.routes[("GET", v3("me.json"))] = (200, Drip(json.dumps(ME).encode() + b" " * 200, delay=0.1))
+        t = time.monotonic()
+        d = self.run_tw("status", env=self.env(TEAMWORK_TEST_TIMEOUT="1", TEAMWORK_TEST_DEADLINE="1.5"))
+        self.assert_error(d, "network")
+        self.assertLess(time.monotonic() - t, 8)
+
+    def test_trickled_error_body_is_cut_short(self):
+        self.server.routes[("PUT", v3("me/timers/1/pause.json"))] = (500, Drip(b"x" * 400, delay=0.1))
+        t = time.monotonic()
+        d = self.run_tw("pause", "1", env=self.env(TEAMWORK_TEST_TIMEOUT="1", TEAMWORK_TEST_DEADLINE="1.5"))
+        self.assert_error(d, "api")
+        self.assertLess(time.monotonic() - t, 8)
+
+    def test_non_finite_numbers_are_refused_or_ignored(self):
+        for payload in (b'{"person": {"id": NaN}}', b'{"person": {"id": 1}, "x": Infinity}',
+                        b'{"person": {"id": 1}, "x": -Infinity}'):
+            self.server.routes[("GET", v3("me.json"))] = (200, payload)
+            self.assert_error(self.run_tw("status"), "api")
+        # 1e400 is valid JSON that parses to infinity: a duration like that counts as 0.
+        self.server.routes[("GET", v3("me.json"))] = (200, ME)
+        self.server.routes[("GET", v3("me/timers.json"))] = (200, (
+            b'{"timers": [{"id": 10, "taskId": 2, "running": false, "duration": 1e400, "userId": 123}],'
+            b' "meta": {"page": {"hasMore": false}}}'))
+        self.server.routes[("GET", v3("tasks.json"))] = (200, (
+            b'{"tasks": [{"id": 2, "name": "T", "estimateMinutes": -1e400}], "meta": {}}'))
+        self.server.routes[("GET", v3("time.json"))] = (200, (
+            b'{"timelogs": [{"id": 1, "minutes": 1e400, "timeLogged": "2026-11-19T09:00:00Z", "userId": 123}]}'))
+        d = self.run_tw("status")
+        self.assertTrue(d["ok"], d)
+        self.assertEqual(d["timers"][0]["elapsedSeconds"], 0)
+        self.assertEqual(d["tasks"][0]["estimateMinutes"], 0)
+        self.assertEqual(d["today"]["loggedSeconds"], 0)
+
+    def test_corrupt_cache_is_ignored(self):
+        cache = os.path.join(self.tmp, "cache")
+        os.makedirs(cache, mode=0o700)
+        with open(os.path.join(cache, "me.json"), "w") as f:
+            f.write("[" * 60000)
+        self.server.routes[("GET", v3("me/timers.json"))] = (200, page("timers", []))
+        self.server.routes[("GET", v3("tasks.json"))] = (200, page("tasks", []))
+        self.server.routes[("GET", v3("time.json"))] = (200, page("timelogs", []))
+        self.assertTrue(self.run_tw("status")["ok"])
+
     def test_me_without_id(self):
         self.server.routes[("GET", v3("me.json"))] = (200, {"person": {"firstName": "x"}})
         self.assert_error(self.run_tw("status"), "api")
@@ -1012,7 +1096,11 @@ class SiteTests(Base):
                "https://user@acme.teamwork.com", "https://acme.teamwork.com:8443",
                "https://bad_host.teamwork.com", "https://", "ftp://acme.teamwork.com",
                "acme.teamwork.com", "https://acme.teamwork.com#frag",
-               "javascript:alert(1)", "https://" + "a" * 300 + ".com", ""]
+               "javascript:alert(1)", "https://" + "a" * 300 + ".com", "",
+               "https://localhost", "https://intranet", "https://\u212aacme.teamwork.com",
+               "https://acme.teamwork.com\\@evil.example", "https://acme.teamwork.com:443",
+               "https://acme.teamwork.com/%2e%2e/", "https://acme.teamwork.com.",
+               "https://[::1]"]
         for site in bad:
             d = self.run_tw("open-url", "1", "--site", site, site=False, env=prod)
             self.assertFalse(d["ok"], site)
@@ -1024,6 +1112,9 @@ class SiteTests(Base):
         self.assertEqual(d, {"ok": True, "url": "https://acme.teamwork.com/app/tasks/42"})
         d = self.run_tw("--site", "https://acme.teamwork.com", "open-url", "42", site=False, env=prod)
         self.assertEqual(d["url"], "https://acme.teamwork.com/app/tasks/42")
+        # A custom domain is allowed.
+        d = self.run_tw("open-url", "7", "--site", "https://projects.example.co.uk", site=False, env=prod)
+        self.assertEqual(d["url"], "https://projects.example.co.uk/app/tasks/7")
 
     def test_missing_site(self):
         self.assert_error(self.run_tw("open-url", "1", site=False), "config")

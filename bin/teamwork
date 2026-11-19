@@ -56,7 +56,13 @@ Test hooks (environment):
   TEAMWORK_KEY_FILE          use only this file for the key (secret-tool is not called)
   TEAMWORK_CACHE_DIR         non-secret cache directory (default ~/.cache/tomhayes.teamwork)
   TEAMWORK_TEST_ALLOW_HTTP=1 allow http:// sites with a port (local mock servers), and
-                             honour TEAMWORK_TEST_NOW (ISO 8601) and TEAMWORK_TEST_TIMEOUT (seconds)
+                             honour TEAMWORK_TEST_NOW (ISO 8601), TEAMWORK_TEST_TIMEOUT and
+                             TEAMWORK_TEST_DEADLINE (seconds)
+
+Limits: each socket operation times out after 15 s, and a whole invocation
+(every request it makes, bodies included) after 90 s, so a server that
+trickles bytes cannot hold a call open. Responses are capped at 5 MiB, and
+JSON NaN/Infinity is refused.
 """
 
 import argparse
@@ -72,6 +78,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -79,6 +86,7 @@ import urllib.request
 APP = "tomhayes.teamwork"
 LEGACY_APP = "tom.teamwork"
 TIMEOUT = 15.0
+DEADLINE = 90.0
 MAX_RESPONSE = 5 * 1024 * 1024
 MAX_NAME = 300
 MAX_DESCRIPTION = 2000
@@ -92,7 +100,8 @@ MAX_KEY_INPUT = 4096
 SECRET_ATTRS = ["service", APP, "account", "api-key"]
 LEGACY_SECRET_ATTRS = ["service", LEGACY_APP, "account", "api-key"]
 MAX_SORT_FIELD = 100
-HOST_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
+# A DNS name of two or more labels (a Teamwork site or a custom domain).
+HOST_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$", re.ASCII)
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
@@ -117,13 +126,29 @@ def now_utc():
     return dt.datetime.now(dt.timezone.utc)
 
 
-def timeout():
-    if test_mode() and os.environ.get("TEAMWORK_TEST_TIMEOUT"):
+def _test_seconds(name, default):
+    if test_mode() and os.environ.get(name):
         try:
-            return max(0.05, min(TIMEOUT, float(os.environ["TEAMWORK_TEST_TIMEOUT"])))
+            v = float(os.environ[name])
         except ValueError:
-            pass
-    return TIMEOUT
+            return default
+        if v == v:
+            return max(0.05, min(default, v))
+    return default
+
+
+def timeout():
+    return _test_seconds("TEAMWORK_TEST_TIMEOUT", TIMEOUT)
+
+
+_deadline = [None]
+
+
+def deadline():
+    """Monotonic time by which this invocation must have finished talking to Teamwork."""
+    if _deadline[0] is None:
+        _deadline[0] = time.monotonic() + _test_seconds("TEAMWORK_TEST_DEADLINE", DEADLINE)
+    return _deadline[0]
 
 
 # ---------------------------------------------------------------- value helpers
@@ -142,7 +167,10 @@ def as_id(v):
 def as_nonneg_int(v, cap=10 ** 9):
     if isinstance(v, bool):
         return 0
-    if isinstance(v, float) and v == v:
+    if isinstance(v, float):
+        # NaN and the infinities (1e400 parses as inf) count as nothing.
+        if v != v or v in (float("inf"), float("-inf")):
+            return 0
         v = int(v)
     if isinstance(v, int):
         return max(0, min(cap, v))
@@ -249,6 +277,10 @@ def validate_site(site):
         raise TWError("Teamwork site URL must not contain credentials", "config")
     if u.path or u.query or u.fragment or s.endswith("?") or s.endswith("#"):
         raise TWError("Teamwork site URL must be the site address only, with no path", "config")
+    # ASCII before any case folding (urlsplit lowers the host itself, and
+    # "\u212a".lower() is a plain "k"): an IDN must be entered as punycode.
+    if not u.netloc.isascii():
+        raise TWError("Teamwork site URL has an invalid host name", "config")
     host = (u.hostname or "").lower()
     if not HOST_RE.match(host):
         raise TWError("Teamwork site URL has an invalid host name", "config")
@@ -284,6 +316,8 @@ def ensure_private_dir(path):
     st = os.lstat(path)
     if not stat.S_ISDIR(st.st_mode):
         raise OSError("not a directory")
+    if st.st_uid != os.getuid():
+        raise OSError("directory belongs to another user")
     if stat.S_IMODE(st.st_mode) != 0o700:
         os.chmod(path, 0o700)
 
@@ -307,11 +341,20 @@ def write_private(path, data):
         raise
 
 
-def read_small(path, limit):
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+def read_small(path, limit, private=False):
+    """Up to limit + 1 bytes of a regular file (never through a symlink).
+
+    private: the file must be ours; group/other permission bits are dropped."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     with os.fdopen(fd, "rb") as f:
-        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
             raise OSError("not a regular file")
+        if private:
+            if st.st_uid != os.getuid():
+                raise OSError("file belongs to another user")
+            if stat.S_IMODE(st.st_mode) & 0o077:
+                os.fchmod(f.fileno(), 0o600)
         return f.read(limit + 1)
 
 
@@ -344,7 +387,7 @@ class KeyStore:
 
     def _read_file(self, path=None):
         try:
-            raw = read_small(path or self.file, MAX_KEY_INPUT)
+            raw = read_small(path or self.file, MAX_KEY_INPUT, private=True)
         except OSError:
             return None
         try:
@@ -434,8 +477,8 @@ def cache_path():
 def cache_load():
     try:
         raw = read_small(cache_path(), 65536)
-        data = json.loads(raw[:65536].decode("utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError):
+        data = parse_json(raw[:65536])
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError):
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -475,10 +518,19 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _reject_constant(name):
+    raise ValueError("non-finite number")
+
+
+def parse_json(raw):
+    """JSON object from bytes; NaN/Infinity are refused as malformed."""
+    return json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
+
+
 def _api_error_detail(body):
     try:
-        data = json.loads(body[:65536].decode("utf-8"))
-    except (ValueError, UnicodeDecodeError):
+        data = parse_json(body[:65536])
+    except (ValueError, UnicodeDecodeError, RecursionError):
         return ""
     errors = data.get("errors") if isinstance(data, dict) else None
     for e in errors if isinstance(errors, list) else []:
@@ -502,7 +554,26 @@ class Client:
             handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context()))
         self.opener = urllib.request.build_opener(*handlers)
 
+    @staticmethod
+    def _read_body(resp, limit, until):
+        """Up to limit + 1 bytes of a response body, giving up at `until`
+        (monotonic) however slowly the bytes arrive."""
+        chunks, total = [], 0
+        while total <= limit:
+            if time.monotonic() > until:
+                raise TimeoutError()
+            b = resp.read1(min(65536, limit + 1 - total))
+            if not b:
+                break
+            chunks.append(b)
+            total += len(b)
+        return b"".join(chunks)
+
     def request(self, method, path, params=None, body=None):
+        until = deadline()
+        left = until - time.monotonic()
+        if left <= 0:
+            raise TWError("Teamwork did not respond in time", "network")
         url = self.site + path
         if params:
             url += "?" + urllib.parse.urlencode(params, safe=",")
@@ -513,12 +584,12 @@ class Client:
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with self.opener.open(req, timeout=timeout()) as resp:
-                raw = resp.read(MAX_RESPONSE + 1)
+            with self.opener.open(req, timeout=max(0.05, min(timeout(), left))) as resp:
+                raw = self._read_body(resp, MAX_RESPONSE, until)
                 status = resp.status
         except urllib.error.HTTPError as e:
             try:
-                detail = _api_error_detail(e.read(65536) or b"")
+                detail = _api_error_detail(self._read_body(e, 65536, until) or b"")
             except Exception:
                 detail = ""
             finally:
@@ -541,7 +612,7 @@ class Client:
         if status == 204 or not raw.strip():
             return {}
         try:
-            parsed = json.loads(raw.decode("utf-8"))
+            parsed = parse_json(raw)
         except (ValueError, UnicodeDecodeError, RecursionError):
             raise TWError("Teamwork sent a malformed response", "api")
         if not isinstance(parsed, dict):
@@ -1082,9 +1153,20 @@ def cmd_open_url(args):
 
 # ---------------------------------------------------------------- argument parsing
 
+def usage_message(message):
+    """argparse's message without the values it quotes: an API key pasted as
+    an argument by mistake must not come back on stdout."""
+    m = str(message)
+    if m.startswith("unrecognized arguments"):
+        return "unrecognized arguments"
+    # Values come quoted (repr): keep only the text before the first quote.
+    m = re.split(r"['\"]", m, maxsplit=1)[0]
+    return " ".join(m.split()).rstrip(" :")[:200]
+
+
 class Parser(argparse.ArgumentParser):
     def error(self, message):
-        raise TWError("Invalid arguments: " + message[:200], "usage")
+        raise TWError("Invalid arguments: " + usage_message(message), "usage")
 
     def exit(self, status=0, message=None):
         raise TWError("Invalid arguments", "usage")

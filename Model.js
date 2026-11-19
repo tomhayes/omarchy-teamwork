@@ -346,20 +346,38 @@ function truncate(text, max) {
 // Dynamic text for a notification. The notification server renders the body
 // as markup and decodes entities first, so escaping cannot keep a task name
 // inert: the characters markup is built from are swapped for look-alikes.
+// Omarchy's server also turns bare http(s) URLs in a body into links, so a
+// word joiner goes between any scheme and its "://"; and bidi controls, which
+// could make text read differently from what it says, are dropped.
 function notifySafe(text, max) {
   var s = str(text, 2000)
+    .replace(/[\u202a-\u202e\u2066-\u2069]/g, "")
     .replace(/&/g, "\uff06")
     .replace(/</g, "\u2039")
     .replace(/>/g, "\u203a")
+    .replace(/([a-z][a-z0-9+.-]*):\/\//gi, "$1\u2060://")
   return truncate(s.trim(), max || 120)
 }
 
-// "https://x.teamwork.com" or "" when the value isn't a bare https origin.
+// A translated template with %1, %2... filled in one pass, so a value that
+// itself contains "%2" (a task name, say) is never filled in again, as
+// chained String.arg() calls would.
+function formatArgs(template, values) {
+  var list = values || []
+  return String(template === undefined || template === null ? "" : template).replace(/%(\d)/g, function(whole, n) {
+    var i = Number(n) - 1
+    return i >= 0 && i < list.length ? String(list[i]) : whole
+  })
+}
+
+// "https://x.teamwork.com" or "" when the value isn't a bare https origin
+// (no credentials, port, path, query or fragment), as bin/teamwork requires.
 function cleanSiteUrl(value) {
   var s = String(value || "").trim().replace(/\/+$/, "")
-  var m = /^https:\/\/([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+)(:\d{1,5})?$/i.exec(s)
-  if (!m) return ""
-  return "https://" + m[1].toLowerCase() + (m[5] || "")
+  if (s.length > 300) return ""
+  var m = /^https:\/\/([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+)$/i.exec(s)
+  if (!m || m[1].length > 253) return ""
+  return "https://" + m[1].toLowerCase()
 }
 
 function taskUrl(siteUrl, taskId) {
@@ -378,6 +396,25 @@ function shouldNag(s) {
   var interval = Math.max(1, Number(s.intervalMin) || 15) * 60000
   var since = Math.max(Number(s.lastNagMs) || 0, Number(s.idleSinceMs) || 0, Number(s.segmentStartMs) || 0)
   return s.nowMs - since >= interval
+}
+
+// The refreshIntervalSec setting as used: 0 turns background polling off,
+// anything else is 15 s to an hour; junk falls back to 60.
+function refreshInterval(value) {
+  var n = Math.round(Number(value))
+  if (value === "" || value === null || value === undefined || typeof value === "boolean" || !isFinite(n)) return 60
+  if (n <= 0) return 0
+  return Math.max(15, Math.min(3600, n))
+}
+
+// Whether the snapshot is recent enough to act on (reminders, warnings).
+// Polling every intervalSec, it must be from the last few polls; with polling
+// off (0) the last refresh stands, however old, until an error replaces it.
+function dataFresh(hasSnapshot, lastError, nowMs, fetchedMs, intervalSec) {
+  if (!hasSnapshot || lastError !== "") return false
+  var interval = Number(intervalSec) || 0
+  if (interval <= 0) return true
+  return (nowMs - fetchedMs) < (interval * 3 + 60) * 1000
 }
 
 // The next poll delay after `failures` consecutive failures: the configured
@@ -409,6 +446,9 @@ if (typeof module !== "undefined" && module.exports) {
     resumeTarget: resumeTarget,
     truncate: truncate,
     notifySafe: notifySafe,
+    formatArgs: formatArgs,
+    refreshInterval: refreshInterval,
+    dataFresh: dataFresh,
     cleanSiteUrl: cleanSiteUrl,
     taskUrl: taskUrl,
     shouldNag: shouldNag,

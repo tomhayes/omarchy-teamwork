@@ -115,7 +115,7 @@
   "settings.nag": "Nag when no timer is running",
   "settings.nagDesc": "During work hours, outside lunch.",
   "settings.nagInterval": "Nag every (minutes)",
-  "settings.refresh": "Refresh every (seconds)",
+  "settings.refresh": "Refresh every (seconds, 0 = off)",
   "settings.longTimer": "Warn when a timer passes (hours, 0 = off)",
   "settings.afterHours": "Warn at lunch and after hours",
   "settings.afterHoursDesc": "Once a day each, when a timer is still running at lunch or the end of the day.",

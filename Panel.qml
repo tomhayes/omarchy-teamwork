@@ -11,6 +11,8 @@ import "Model.js" as Model
 // Teamwork timers in the bar. Everything that talks to Teamwork goes through
 // bin/teamwork (one JSON object per call); this file keeps the snapshot, ticks
 // the running timer locally, and owns the background poll and reminders.
+// refreshIntervalSec 0 turns the poll off: it then refreshes only when the
+// panel opens and after an action, and reminders work from that snapshot.
 //
 // A bar surface exists per monitor, so the first live instance (the leader)
 // polls and sends reminders and hands each snapshot to its peers.
@@ -86,7 +88,8 @@ Panel {
   })
   readonly property bool nagEnabled: settingValue("nagEnabled") !== false
   readonly property int nagIntervalMin: clampInt(settingValue("nagIntervalMin"), 5, 120, 15)
-  readonly property int refreshIntervalSec: clampInt(settingValue("refreshIntervalSec"), 15, 3600, 60)
+  // 0 = no background polling (Model.refreshInterval).
+  readonly property int refreshIntervalSec: Model.refreshInterval(settingValue("refreshIntervalSec"))
   readonly property int longTimerWarnHours: clampInt(settingValue("longTimerWarnHours"), 0, 24, 3)
   readonly property bool notifyAfterHours: settingValue("notifyAfterHours") !== false
 
@@ -154,8 +157,8 @@ Panel {
   readonly property int loggedWeek: snapshot && snapshot.week.start === weekWork.start ? snapshot.week.loggedSeconds : 0
   readonly property bool inWorkTime: todayWork.phase === "working"
   readonly property var resumeTarget: Model.resumeTarget(snapshot, lastTask)
-  readonly property bool dataFresh: !!snapshot && lastError === ""
-    && (nowMs - fetchedMs) < (refreshIntervalSec * 3 + 60) * 1000
+  // With polling off the last snapshot counts as fresh, so reminders still run.
+  readonly property bool dataFresh: Model.dataFresh(!!snapshot, lastError, nowMs, fetchedMs, refreshIntervalSec)
 
   // ---------------------------------------------------------------- formats
   function digits(text) {
@@ -250,7 +253,13 @@ Panel {
     root.hasKey = s.hasKey
     root.keyChecked = s.keyChecked
     if (s.lastTask) root.lastTask = s.lastTask
-    pollTimer.restart()
+    root.schedulePoll()
+  }
+
+  // (Re)arms the background poll, or stops it when polling is off.
+  function schedulePoll() {
+    if (root.configured && root.refreshIntervalSec > 0) pollTimer.restart()
+    else pollTimer.stop()
   }
 
   // -------------------------------------------------------------- helper
@@ -334,7 +343,7 @@ Panel {
         root.lastErrorCode = res.code
       }
       root.shareState()
-      pollTimer.restart()
+      root.schedulePoll()
       root.housekeeping()
     })
   }
@@ -588,7 +597,8 @@ Panel {
       warned[t.id] = true
       root.warnedLong = warned
       var a = root.timerActions(t.id)
-      root.notify(root.tr("notify.longTitle"), root.tr("notify.longBody").arg(name).arg(root.hm(root.currentSeconds)), a.actions, a.handler)
+      // One pass, so a "%2" in the task name stays as typed.
+      root.notify(root.tr("notify.longTitle"), Model.formatArgs(root.tr("notify.longBody"), [name, root.hm(root.currentSeconds)]), a.actions, a.handler)
     }
 
     var phase = root.todayWork.phase
@@ -653,7 +663,7 @@ Panel {
       lunchEnd: WorkTime.parseHHMM(d.lunchEnd) !== null ? WorkTime.formatHHMM(WorkTime.parseHHMM(d.lunchEnd)) : String(d.lunchEnd || ""),
       nagEnabled: d.nagEnabled !== false,
       nagIntervalMin: root.clampInt(d.nagIntervalMin, 5, 120, 15),
-      refreshIntervalSec: root.clampInt(d.refreshIntervalSec, 15, 3600, 60),
+      refreshIntervalSec: Model.refreshInterval(d.refreshIntervalSec),
       longTimerWarnHours: root.clampInt(d.longTimerWarnHours, 0, 24, 3),
       notifyAfterHours: d.notifyAfterHours !== false,
       sortField: root.cleanSortField(d.sortField)
@@ -718,6 +728,9 @@ Panel {
       root.shareState()
       if (done) done(res.ok === true)
     }, k + "\n")
+    // Drop this function's references to the key; the Process clears its own.
+    k = ""
+    key = ""
   }
 
   function clearKey() {
@@ -774,11 +787,11 @@ Panel {
   Timer {
     id: pollTimer
     interval: Model.backoffMs(root.refreshIntervalSec, root.failures)
-    running: root.configured
+    running: root.configured && root.refreshIntervalSec > 0
     repeat: false
     onTriggered: {
       if (root.isLeader()) root.refresh()
-      else pollTimer.restart()
+      else root.schedulePoll()
     }
   }
 

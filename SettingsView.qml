@@ -3,6 +3,7 @@ import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
 import "WorkTime.js" as WorkTime
+import "Model.js" as Model
 
 // The panel's settings page. Non-secret values are edited as drafts on the
 // host (Panel.qml) and written to shell.json by its saveSettings(); the API
@@ -292,10 +293,11 @@ Column {
 
     NumberField {
       label: view.tr("settings.refresh")
-      from: 15
+      // 0 turns background polling off; 1-14 are saved as 15.
+      from: 0
       to: 3600
       stepSize: 15
-      value: view.host ? Number(view.host.draft.refreshIntervalSec) || 60 : 60
+      value: view.host ? Model.refreshInterval(view.host.draft.refreshIntervalSec) : 60
       foreground: view.fg
       fontFamily: view.family
       onModified: function(v) { view.host.setDraft("refreshIntervalSec", v) }

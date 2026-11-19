@@ -43,7 +43,7 @@ Edited in the panel's Settings (the cog) or the stock Omarchy widget settings, a
 | `lunchStart` / `lunchEnd` | `12:30` / `13:30` | Lunch, not counted as work time. |
 | `nagEnabled` | `true` | Notify when no timer is running during work hours. |
 | `nagIntervalMin` | `15` | Minutes between nags (5–120). |
-| `refreshIntervalSec` | `60` | Background refresh interval in seconds (15–3600). |
+| `refreshIntervalSec` | `60` | Background refresh interval in seconds (15–3600); `0` turns background polling off. |
 | `longTimerWarnHours` | `3` | Warn once when a timer passes this many hours; 0 is off. |
 | `notifyAfterHours` | `true` | Warn once a day each if a timer is still running at lunch or after hours. |
 
@@ -58,7 +58,9 @@ All traffic goes through `bin/teamwork`, over HTTPS, to the site URL you set, an
 | Searching | `GET tasks.json?searchTerm=…` |
 | Saving the key | `GET me.json`, to check it |
 
-It refreshes in the background every `refreshIntervalSec` (60 s by default, configurable from 15 s to an hour), when the panel opens, and after each action; after failures it backs off, doubling up to 10 minutes. With several monitors only one bar instance polls. The custom-field sideload (`include=customfieldTasks,customfields`) is requested only when `sortField` is set. Nothing else is contacted: no telemetry, no update checks. Opening a task hands its URL to `xdg-open`.
+It refreshes in the background every `refreshIntervalSec` (60 s by default, configurable from 15 s to an hour), when the panel opens, and after each action; after failures it backs off, doubling up to 10 minutes. With several monitors only one bar instance polls. Set `refreshIntervalSec` to `0` to turn background polling off: it then contacts Teamwork only when the shell starts, when the panel opens, and after an action you take. The running timer still ticks locally, but reminders and warnings rely on the last refresh, so a timer started or stopped elsewhere (the Teamwork web app, another machine) isn't noticed until the next one.
+
+Each request times out after 15 s of silence and each helper call after 90 s in all; responses over 5 MiB are refused. The custom-field sideload (`include=customfieldTasks,customfields`) is requested only when `sortField` is set. Nothing else is contacted: no telemetry, no update checks. Opening a task hands its URL to `xdg-open`.
 
 ## Notifications
 
@@ -67,6 +69,8 @@ Sent with `notify-send`, all optional in Settings:
 - **No timer running**: during work hours (outside lunch), after `nagIntervalMin` minutes with nothing timing, with **Resume/Start** and **Open** actions. Each nag replaces the last.
 - **Timer still running**: once per timer, past `longTimerWarnHours`.
 - **Lunch / after hours**: once a day each, if a timer is still running.
+
+With background polling off (`refreshIntervalSec` 0), these rely on the last refresh: open the panel now and then to keep them accurate.
 
 ## IPC
 
@@ -82,8 +86,9 @@ omarchy-shell tomhayes.teamwork state         # JSON summary, no secrets
 
 - The API key is read from the keyring or the 0600 file only by `bin/teamwork`; it is never printed, logged, cached, put in `shell.json`, or passed on a command line.
 - `~/.cache/tomhayes.teamwork/me.json` caches your Teamwork user id and name, nothing else.
-- Text from Teamwork is shown as plain text and bounded (names to 300 characters, sort-field values to 40, at most 500 tasks). Notification text has markup characters replaced.
+- Text from Teamwork is shown as plain text and bounded (names to 300 characters, sort-field values to 40, at most 500 tasks). In notification text, markup characters are replaced with look-alikes, URLs are kept from turning into links, and bidirectional-override characters are dropped.
 - Commands run as argv arrays, never through a shell. Task links are built from the validated site URL and a numeric id.
+- The site URL must be a bare `https://` origin: no credentials, port, path or query. Custom Teamwork domains work, so the key goes to whatever site you enter: check it before saving the key.
 
 ## Tests
 
