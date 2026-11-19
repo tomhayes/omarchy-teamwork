@@ -1,0 +1,1204 @@
+#!/usr/bin/env python3
+"""Teamwork.com timer helper for the tomhayes.teamwork Omarchy bar widget.
+
+Every invocation prints exactly one JSON object on stdout and exits 0.
+Errors: {"ok": false, "error": "<message>", "code": "auth|network|config|api|usage"}.
+
+Common options: --site https://<yours>.teamwork.com (required for anything that
+talks to Teamwork) and --sort-field NAME (optional: a task custom field whose
+value is returned as priorityOrder/priorityRank; off when absent or empty).
+
+Teamwork Projects API endpoints used (all v3; checked against the official
+OpenAPI spec at https://apidocs.teamwork.com/api/oas/download?slug=teamwork&api_version=v3
+and Teamwork's own Go SDK, github.com/Teamwork/twapi-go-sdk):
+
+  Auth    HTTP Basic, username = API key, password = "X"
+  GET     /projects/api/v3/me.json                        -> {"person": {id, firstName, lastName}}
+  GET     /projects/api/v3/me/timers.json                 -> {"timers": [...], "included": {...}, "meta": {"page": {"hasMore"}}}
+            params: taskId, include=tasks,tasks.tasklists,projects, page, pageSize
+            timer: id, taskId, projectId, running, duration (seconds of finished runs),
+                   lastStartedAt, serverTime, description, billable, deleted, userId
+            elapsed = duration + (now - lastStartedAt if running)
+  POST    /projects/api/v3/me/timers.json                 body {"timer": {taskId, projectId, isRunning, stopRunningTimers}}
+  GET     /projects/api/v3/timers/{id}.json               -> {"timer": {...}}
+  PUT     /projects/api/v3/me/timers/{id}.json            body {"timer": {description, isBillable, projectId, taskId, isRunning}}
+  PUT     /projects/api/v3/me/timers/{id}/pause.json      -> {"timer": {...}}
+  PUT     /projects/api/v3/me/timers/{id}/resume.json     -> {"timer": {...}} (Teamwork pauses other timers)
+  PUT     /projects/api/v3/me/timers/{id}/complete.json   -> logs the timer as a time entry and deletes it
+  DELETE  /projects/api/v3/me/timers/{id}.json            -> 204
+  GET     /projects/api/v3/tasks.json                     -> {"tasks": [...], "included": {projects, tasklists, timeTotals}, "meta"}
+            params: responsiblePartyIds, ids, searchTerm, includeCompletedTasks,
+                    include=projects,tasklists,timeTotals, orderBy, page, pageSize
+            task: id, name, dueDate, estimateMinutes, tasklistId; tasklist: id, name, projectId;
+            timeTotals[taskId].loggedMinutes
+            include=customfieldTasks,customfields sideloads the task custom field values
+            (customfieldTasks: id, customfieldId, taskId, value) and their definitions
+            (customfields: id, name, type, projectId, options); requested only when
+            --sort-field names a custom field to show and rank tasks by
+  GET     /projects/api/v3/tasks/{id}.json                -> {"task": {...}, "included": {...}} (include=projects,tasklists)
+  GET     /projects/api/v3/time.json                      -> {"timelogs": [...], "included": {...}, "meta"}
+            params: startDate, endDate, assignedToUserIds, include=tasks,tasks.tasklists,projects, page, pageSize
+            timelog: id, minutes, timeLogged (UTC), userId, taskId, projectId, deleted
+  POST    /projects/api/v3/tasks/{id}/time.json           body {"timelog": {taskId, date, time, isUtc, hasStartTime,
+                                                                hours, minutes, description, isBillable}}
+
+v1 fallbacks were not needed: v3 covers every operation above.
+
+Secrets: the API key comes from the Secret Service (secret-tool, service
+tomhayes.teamwork account api-key) or the fallback file
+~/.local/state/tomhayes.teamwork/api-key (0600, dir 0700). It is never printed,
+logged, cached, or passed in a subprocess argv (secret-tool store reads stdin).
+A key stored by an earlier version under the id tom.teamwork (keyring service or
+~/.local/state/tom.teamwork/api-key) is moved to the new place the first time no
+key is found there, and the old copy deleted.
+
+Test hooks (environment):
+  TEAMWORK_KEY_FILE          use only this file for the key (secret-tool is not called)
+  TEAMWORK_CACHE_DIR         non-secret cache directory (default ~/.cache/tomhayes.teamwork)
+  TEAMWORK_TEST_ALLOW_HTTP=1 allow http:// sites with a port (local mock servers), and
+                             honour TEAMWORK_TEST_NOW (ISO 8601) and TEAMWORK_TEST_TIMEOUT (seconds)
+"""
+
+import argparse
+import base64
+import datetime as dt
+import http.client
+import json
+import os
+import re
+import socket
+import ssl
+import stat
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+APP = "tomhayes.teamwork"
+LEGACY_APP = "tom.teamwork"
+TIMEOUT = 15.0
+MAX_RESPONSE = 5 * 1024 * 1024
+MAX_NAME = 300
+MAX_DESCRIPTION = 2000
+MAX_TASKS = 500
+MAX_TIMERS = 200
+MAX_ENTRIES = 2500
+MAX_PAGES = 20
+MAX_SEARCH = 30
+MAX_ID = 2 ** 53
+MAX_KEY_INPUT = 4096
+SECRET_ATTRS = ["service", APP, "account", "api-key"]
+LEGACY_SECRET_ATTRS = ["service", LEGACY_APP, "account", "api-key"]
+MAX_SORT_FIELD = 100
+HOST_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
+
+class TWError(Exception):
+    def __init__(self, message, code="api", http_status=None):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.http_status = http_status
+
+
+def test_mode():
+    return os.environ.get("TEAMWORK_TEST_ALLOW_HTTP") == "1"
+
+
+def now_utc():
+    if test_mode() and os.environ.get("TEAMWORK_TEST_NOW"):
+        t = parse_time(os.environ["TEAMWORK_TEST_NOW"])
+        if t is not None:
+            return t
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def timeout():
+    if test_mode() and os.environ.get("TEAMWORK_TEST_TIMEOUT"):
+        try:
+            return max(0.05, min(TIMEOUT, float(os.environ["TEAMWORK_TEST_TIMEOUT"])))
+        except ValueError:
+            pass
+    return TIMEOUT
+
+
+# ---------------------------------------------------------------- value helpers
+
+def as_id(v):
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v if 0 < v < MAX_ID else None
+    if isinstance(v, str) and v.isdigit() and len(v) <= 16:
+        n = int(v)
+        return n if 0 < n < MAX_ID else None
+    return None
+
+
+def as_nonneg_int(v, cap=10 ** 9):
+    if isinstance(v, bool):
+        return 0
+    if isinstance(v, float) and v == v:
+        v = int(v)
+    if isinstance(v, int):
+        return max(0, min(cap, v))
+    return 0
+
+
+def text(v, limit=MAX_NAME):
+    if not isinstance(v, str):
+        return ""
+    return v[:limit]
+
+
+def obj(v):
+    return v if isinstance(v, dict) else {}
+
+
+def rel_id(o, key):
+    """An id given as `<key>Id` or as a `<key>` relationship {"id": ...}."""
+    i = as_id(o.get(key + "Id"))
+    if i is None:
+        i = as_id(obj(o.get(key)).get("id"))
+    return i
+
+
+def parse_time(v):
+    if not isinstance(v, str) or not v or len(v) > 64:
+        return None
+    s = v.strip()
+    if s.endswith("Z") or s.endswith("z"):
+        s = s[:-1] + "+00:00"
+    try:
+        t = dt.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)
+    return t
+
+
+def last_started_ts(v):
+    t = parse_time(v)
+    return t.timestamp() if t else 0.0
+
+
+def iso_utc(t):
+    return t.astimezone(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def date_only(v):
+    if isinstance(v, str) and len(v) >= 10 and DATE_RE.match(v[:10]):
+        try:
+            dt.date.fromisoformat(v[:10])
+            return v[:10]
+        except ValueError:
+            return None
+    return None
+
+
+class Included:
+    """Sideloaded objects (`included`), merged across pages, keyed by kind then id."""
+
+    def __init__(self):
+        self.data = {}
+
+    def merge(self, inc):
+        for kind, items in obj(inc).items():
+            if not isinstance(kind, str):
+                continue
+            bucket = self.data.setdefault(kind, {})
+            if isinstance(items, dict):
+                pairs = items.items()
+            elif isinstance(items, list):
+                pairs = ((obj(x).get("id"), x) for x in items)
+            else:
+                continue
+            for k, v in pairs:
+                i = as_id(k)
+                if i is not None and isinstance(v, dict) and len(bucket) < 5000:
+                    bucket[i] = v
+
+    def get(self, kind, i):
+        if i is None:
+            return {}
+        return self.data.get(kind, {}).get(i, {})
+
+
+# ---------------------------------------------------------------- site / paths
+
+def validate_site(site):
+    if not site:
+        raise TWError("Teamwork site URL is not set", "config")
+    if not isinstance(site, str) or len(site) > 300:
+        raise TWError("Teamwork site URL is too long", "config")
+    s = site.strip().rstrip("/")
+    try:
+        u = urllib.parse.urlsplit(s)
+        port = u.port
+    except ValueError:
+        raise TWError("Teamwork site URL is not valid", "config")
+    allowed = ("https", "http") if test_mode() else ("https",)
+    if u.scheme.lower() not in allowed:
+        raise TWError("Teamwork site URL must start with https://", "config")
+    if "@" in u.netloc or u.username is not None or u.password is not None:
+        raise TWError("Teamwork site URL must not contain credentials", "config")
+    if u.path or u.query or u.fragment or s.endswith("?") or s.endswith("#"):
+        raise TWError("Teamwork site URL must be the site address only, with no path", "config")
+    host = (u.hostname or "").lower()
+    if not HOST_RE.match(host):
+        raise TWError("Teamwork site URL has an invalid host name", "config")
+    if port is not None and not test_mode():
+        raise TWError("Teamwork site URL must not include a port", "config")
+    netloc = host if port is None else "%s:%d" % (host, port)
+    return "%s://%s" % (u.scheme.lower(), netloc)
+
+
+def task_url(site, task_id):
+    return "%s/app/tasks/%d" % (site, task_id)
+
+
+def state_dir(app=APP):
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(base, app)
+
+
+def cache_dir():
+    if os.environ.get("TEAMWORK_CACHE_DIR"):
+        return os.environ["TEAMWORK_CACHE_DIR"]
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, APP)
+
+
+def legacy_cache_dir():
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return os.path.join(base, LEGACY_APP)
+
+
+def ensure_private_dir(path):
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode):
+        raise OSError("not a directory")
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        os.chmod(path, 0o700)
+
+
+def write_private(path, data):
+    d = os.path.dirname(path)
+    ensure_private_dir(d)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_small(path, limit):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            raise OSError("not a regular file")
+        return f.read(limit + 1)
+
+
+# ---------------------------------------------------------------- key storage
+
+def valid_key(k):
+    return isinstance(k, str) and 4 <= len(k) <= 256 and all(33 <= ord(c) <= 126 for c in k) and ":" not in k
+
+
+class KeyStore:
+    """API key storage: Secret Service via secret-tool, else a 0600 file.
+
+    TEAMWORK_KEY_FILE selects a file-only store (used by the tests); it also
+    turns off the migration from the old tom.teamwork id."""
+
+    def __init__(self):
+        self.override = os.environ.get("TEAMWORK_KEY_FILE") or None
+        self.file = self.override or os.path.join(state_dir(), "api-key")
+        self.legacy_file = os.path.join(state_dir(LEGACY_APP), "api-key")
+
+    def _secret_tool(self, args, stdin=None):
+        if self.override:
+            return None
+        try:
+            p = subprocess.run(["secret-tool"] + args, input=stdin, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, timeout=10, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return p
+
+    def _read_file(self, path=None):
+        try:
+            raw = read_small(path or self.file, MAX_KEY_INPUT)
+        except OSError:
+            return None
+        try:
+            k = raw[:MAX_KEY_INPUT].decode("utf-8").strip()
+        except UnicodeDecodeError:
+            return None
+        return k if valid_key(k) else None
+
+    def _lookup(self, attrs):
+        p = self._secret_tool(["lookup"] + attrs)
+        if p is not None and p.returncode == 0:
+            try:
+                k = p.stdout[:MAX_KEY_INPUT].decode("utf-8").strip()
+            except UnicodeDecodeError:
+                k = ""
+            if valid_key(k):
+                return k
+        return None
+
+    def load(self):
+        return self._lookup(SECRET_ATTRS) or self._read_file() or self._migrate()
+
+    def _migrate(self):
+        """Move a key stored under the old tom.teamwork id to the current one.
+
+        The old copy is deleted only once the new one is stored."""
+        if self.override:
+            return None
+        from_keyring = self._lookup(LEGACY_SECRET_ATTRS)
+        key = from_keyring or self._read_file(self.legacy_file)
+        if not key:
+            return None
+        try:
+            self.save(key)
+        except TWError:
+            return key
+        self._clear_legacy()
+        return key
+
+    def _clear_legacy(self):
+        self._secret_tool(["clear"] + LEGACY_SECRET_ATTRS)
+        for path in (self.legacy_file, os.path.join(legacy_cache_dir(), "me.json")):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        for d in (os.path.dirname(self.legacy_file), legacy_cache_dir()):
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
+
+    def save(self, key):
+        p = self._secret_tool(["store", "--label=Teamwork API key"] + SECRET_ATTRS, stdin=key.encode("utf-8"))
+        if p is not None and p.returncode == 0:
+            check = self._secret_tool(["lookup"] + SECRET_ATTRS)
+            if check is not None and check.returncode == 0 and check.stdout.decode("utf-8", "replace").strip() == key:
+                self._remove_file()
+                return "keyring"
+        try:
+            write_private(self.file, key.encode("utf-8") + b"\n")
+        except OSError:
+            raise TWError("Could not store the API key", "config")
+        return "file"
+
+    def _remove_file(self):
+        try:
+            os.unlink(self.file)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise TWError("Could not remove the stored API key file", "config")
+
+    def clear(self):
+        self._secret_tool(["clear"] + SECRET_ATTRS)
+        self._remove_file()
+        if not self.override:
+            self._clear_legacy()
+
+
+# ---------------------------------------------------------------- cache (no secrets)
+
+def cache_path():
+    return os.path.join(cache_dir(), "me.json")
+
+
+def cache_load():
+    try:
+        raw = read_small(cache_path(), 65536)
+        data = json.loads(raw[:65536].decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def cache_get_me(site):
+    me = obj(cache_load().get(site))
+    i = as_id(me.get("id"))
+    if i is None:
+        return None
+    return {"id": i, "name": text(me.get("name"))}
+
+
+def cache_put_me(site, me):
+    data = cache_load()
+    data = {k: v for k, v in data.items() if isinstance(k, str)}
+    data[site] = {"id": me["id"], "name": me["name"]}
+    if len(data) > 20:
+        data = {site: data[site]}
+    try:
+        write_private(cache_path(), json.dumps(data).encode("utf-8"))
+    except OSError:
+        pass
+
+
+def cache_clear():
+    try:
+        os.unlink(cache_path())
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- HTTP
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # Never follow redirects: the Authorization header would go with them.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _api_error_detail(body):
+    try:
+        data = json.loads(body[:65536].decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    errors = data.get("errors") if isinstance(data, dict) else None
+    for e in errors if isinstance(errors, list) else []:
+        if isinstance(e, dict):
+            msg = e.get("detail") or e.get("title") or e.get("message")
+            if isinstance(msg, str) and msg.strip():
+                return msg.strip()[:200]
+    if isinstance(data, dict):
+        for k in ("MESSAGE", "message", "error"):
+            if isinstance(data.get(k), str) and data[k].strip():
+                return data[k].strip()[:200]
+    return ""
+
+
+class Client:
+    def __init__(self, site, key):
+        self.site = site
+        self.auth = "Basic " + base64.b64encode((key + ":X").encode("utf-8")).decode("ascii")
+        handlers = [_NoRedirect()]
+        if site.startswith("https://"):
+            handlers.append(urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+        self.opener = urllib.request.build_opener(*handlers)
+
+    def request(self, method, path, params=None, body=None):
+        url = self.site + path
+        if params:
+            url += "?" + urllib.parse.urlencode(params, safe=",")
+        data = None
+        headers = {"Authorization": self.auth, "Accept": "application/json", "User-Agent": "tomhayes.teamwork-bar/1"}
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with self.opener.open(req, timeout=timeout()) as resp:
+                raw = resp.read(MAX_RESPONSE + 1)
+                status = resp.status
+        except urllib.error.HTTPError as e:
+            try:
+                detail = _api_error_detail(e.read(65536) or b"")
+            except Exception:
+                detail = ""
+            finally:
+                e.close()
+            err = self._status_error(e.code, detail)
+            err.http_status = e.code
+            raise err
+        except (TimeoutError, socket.timeout):
+            raise TWError("Teamwork did not respond in time", "network")
+        except urllib.error.URLError as e:
+            if isinstance(e.reason, (TimeoutError, socket.timeout)):
+                raise TWError("Teamwork did not respond in time", "network")
+            if isinstance(e.reason, ssl.SSLError):
+                raise TWError("Secure connection to Teamwork failed", "network")
+            raise TWError("Could not reach Teamwork", "network")
+        except (ConnectionError, http.client.HTTPException, ssl.SSLError, OSError):
+            raise TWError("Connection to Teamwork failed", "network")
+        if len(raw) > MAX_RESPONSE:
+            raise TWError("Teamwork response was too large", "api")
+        if status == 204 or not raw.strip():
+            return {}
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            raise TWError("Teamwork sent a malformed response", "api")
+        if not isinstance(parsed, dict):
+            raise TWError("Teamwork sent an unexpected response", "api")
+        return parsed
+
+    @staticmethod
+    def _status_error(code, detail):
+        if code == 401:
+            return TWError("Teamwork rejected the API key", "auth")
+        if 300 <= code < 400:
+            return TWError("Teamwork redirected the request; check the site URL", "config")
+        if code == 403:
+            return TWError("Teamwork denied permission" + (": " + detail if detail else ""), "api")
+        if code == 404:
+            return TWError("Not found in Teamwork", "api")
+        if code == 429:
+            return TWError("Teamwork rate limit reached; try again shortly", "api")
+        if code >= 500:
+            return TWError("Teamwork server error (HTTP %d)" % code, "api")
+        return TWError(detail or ("Teamwork request failed (HTTP %d)" % code), "api")
+
+    def get_all(self, path, params, list_key, max_items, page_size):
+        items, inc = [], Included()
+        for page in range(1, MAX_PAGES + 1):
+            p = dict(params)
+            p["page"] = str(page)
+            p["pageSize"] = str(page_size)
+            data = self.request("GET", path, p)
+            batch = data.get(list_key)
+            if batch is None:
+                batch = []
+            if not isinstance(batch, list):
+                raise TWError("Teamwork sent an unexpected response", "api")
+            inc.merge(data.get("included"))
+            items.extend(x for x in batch if isinstance(x, dict))
+            more = obj(obj(data.get("meta")).get("page")).get("hasMore") is True
+            if not batch or not more or len(items) >= max_items:
+                break
+        return items[:max_items], inc
+
+
+# ---------------------------------------------------------------- formatting
+
+def me_from(data):
+    p = obj(data.get("person"))
+    i = as_id(p.get("id"))
+    if i is None:
+        raise TWError("Teamwork sent an unexpected response for the current user", "api")
+    name = " ".join(x for x in (text(p.get("firstName")).strip(), text(p.get("lastName")).strip()) if x)
+    return {"id": i, "name": text(name or p.get("userName") or p.get("email"))}
+
+
+def timer_elapsed(t, now):
+    seconds = as_nonneg_int(t.get("duration"))
+    if t.get("running") is True:
+        started = parse_time(t.get("lastStartedAt"))
+        server_now = parse_time(t.get("serverTime")) or now
+        if started is not None:
+            seconds += max(0, int((server_now - started).total_seconds()))
+    return seconds
+
+
+def task_project_id(task, inc):
+    pid = rel_id(task, "project")
+    if pid is None:
+        tl = inc.get("tasklists", rel_id(task, "tasklist"))
+        pid = rel_id(tl, "project")
+    return pid
+
+
+def format_timer(t, inc, now, fallback_names=None):
+    tid = rel_id(t, "task")
+    pid = rel_id(t, "project")
+    task = inc.get("tasks", tid)
+    if pid is None and task:
+        pid = task_project_id(task, inc)
+    started = parse_time(t.get("lastStartedAt"))
+    fb = fallback_names or {}
+    return {
+        "id": as_id(t.get("id")),
+        "taskId": tid,
+        "taskName": text(task.get("name")) or text(fb.get("taskName")),
+        "projectId": pid,
+        "projectName": text(inc.get("projects", pid).get("name")) or text(fb.get("projectName")),
+        "running": t.get("running") is True,
+        "elapsedSeconds": timer_elapsed(t, now),
+        "lastStartedAt": iso_utc(started) if started else None,
+        "description": text(t.get("description"), MAX_DESCRIPTION),
+        "billable": t.get("billable") is True,
+    }
+
+
+MAX_PRIORITY = 40
+PRIORITY_RANK_RE = re.compile(r"^[^\w]*(\d{1,9})")
+
+
+def priority_value(v):
+    """Display string for a custom field value, or None."""
+    if isinstance(v, list):
+        v = next((x for x in v if isinstance(x, (str, int, float)) and not isinstance(x, bool)), None)
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, float):
+        v = int(v) if v == v and v.is_integer() and abs(v) < MAX_ID else None
+        if v is None:
+            return None
+    if isinstance(v, int):
+        v = str(v)
+    if not isinstance(v, str):
+        return None
+    s = " ".join(v.split())[:MAX_PRIORITY].strip()
+    return s or None
+
+
+def priority_rank(s):
+    """The leading number of a priority value: "1st" -> 1, "#3" -> 3, "2" -> 2."""
+    m = PRIORITY_RANK_RE.match(s) if isinstance(s, str) else None
+    return int(m.group(1)) if m else None
+
+
+def field_key(name):
+    """A custom field name as compared: spaces collapsed, case folded."""
+    return " ".join(name.split()).casefold() if isinstance(name, str) else ""
+
+
+def priority_map(inc, sort_field):
+    """taskId -> the value of the custom field named `sort_field` (matched
+    ignoring case and spacing), from the customfields/customfieldTasks sideloads."""
+    if not sort_field:
+        return {}
+    cached = getattr(inc, "_priority", None)
+    if cached is not None:
+        return cached
+    want = field_key(sort_field)
+    fields = {i for i, f in inc.data.get("customfields", {}).items() if want and field_key(f.get("name")) == want}
+    out = {}
+    for i in sorted(inc.data.get("customfieldTasks", {})):
+        v = inc.data["customfieldTasks"][i]
+        if rel_id(v, "customfield") not in fields:
+            continue
+        tid = rel_id(v, "task")
+        val = priority_value(v.get("value"))
+        if tid is not None and val is not None and tid not in out:
+            out[tid] = val
+    inc._priority = out
+    return out
+
+
+def format_task(site, task, inc, recent=False, sort_field=None):
+    tid = as_id(task.get("id"))
+    prio = priority_map(inc, sort_field).get(tid)
+    tl_id = rel_id(task, "tasklist")
+    tl = inc.get("tasklists", tl_id)
+    pid = task_project_id(task, inc)
+    totals = inc.get("timeTotals", tid)
+    return {
+        "id": tid,
+        "name": text(task.get("name")),
+        "projectId": pid,
+        "projectName": text(inc.get("projects", pid).get("name")),
+        "tasklistName": text(tl.get("name")),
+        "dueDate": date_only(task.get("dueDate")),
+        "estimateMinutes": as_nonneg_int(task.get("estimateMinutes")),
+        "trackedTodaySeconds": 0,
+        "trackedWeekSeconds": 0,
+        "trackedTotalSeconds": as_nonneg_int(totals.get("loggedMinutes")) * 60,
+        "url": task_url(site, tid),
+        "recent": recent,
+        "timerId": None,
+        "timerRunning": False,
+        "priorityOrder": prio,
+        "priorityRank": priority_rank(prio),
+    }
+
+
+TASK_INCLUDE_BASE = "projects,tasklists,timeTotals"
+TASK_INCLUDE = TASK_INCLUDE_BASE + ",customfieldTasks,customfields"
+
+
+def with_task_include(call, sort_field):
+    """Run a tasks.json request, with the custom field sideloads only when a
+    sort field is set; if Teamwork rejects those (HTTP 400/422), retry
+    without them so tasks still load."""
+    if not sort_field:
+        return call(TASK_INCLUDE_BASE)
+    try:
+        return call(TASK_INCLUDE)
+    except TWError as e:
+        if e.http_status in (400, 422):
+            return call(TASK_INCLUDE_BASE)
+        raise
+
+
+RELATED_INCLUDE = "tasks,tasks.tasklists,projects"
+
+
+# ---------------------------------------------------------------- commands
+
+def need_site(args):
+    return validate_site(getattr(args, "site", None))
+
+
+def sort_field_of(args):
+    return getattr(args, "sort_field", None) or None
+
+
+def need_client(args):
+    site = need_site(args)
+    key = KeyStore().load()
+    if not key:
+        raise TWError("No Teamwork API key configured", "config")
+    return Client(site, key)
+
+
+def get_me(c):
+    me = cache_get_me(c.site)
+    if me is None:
+        me = me_from(c.request("GET", "/projects/api/v3/me.json"))
+        cache_put_me(c.site, me)
+    return me
+
+
+def list_my_timers(c, extra=None):
+    params = {"include": RELATED_INCLUDE}
+    params.update(extra or {})
+    timers, inc = c.get_all("/projects/api/v3/me/timers.json", params, "timers", MAX_TIMERS, 100)
+    return [t for t in timers if as_id(t.get("id")) is not None and t.get("deleted") is not True], inc
+
+
+def cmd_has_key(args):
+    return {"ok": True, "hasKey": bool(KeyStore().load())}
+
+
+def cmd_set_key(args):
+    site = need_site(args)
+    raw = sys.stdin.buffer.read(MAX_KEY_INPUT + 1)
+    if len(raw) > MAX_KEY_INPUT:
+        raise TWError("API key input is too long", "usage")
+    try:
+        key = raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        raise TWError("API key is not valid text", "usage")
+    if not key:
+        raise TWError("No API key given on stdin", "usage")
+    if not valid_key(key):
+        raise TWError("API key has an invalid format", "usage")
+    me = me_from(Client(site, key).request("GET", "/projects/api/v3/me.json"))
+    storage = KeyStore().save(key)
+    cache_put_me(site, me)
+    return {"ok": True, "user": me, "storage": storage}
+
+
+def cmd_clear_key(args):
+    KeyStore().clear()
+    cache_clear()
+    return {"ok": True}
+
+
+def cmd_status(args):
+    c = need_client(args)
+    now = now_utc()
+    me = get_me(c)
+    uid = me["id"]
+
+    local_now = now.astimezone()
+    today = local_now.date()
+    week_start = today - dt.timedelta(days=today.weekday())
+    week_days = [week_start + dt.timedelta(days=i) for i in range(7)]
+
+    timers_raw, tinc = list_my_timers(c)
+    timers_raw = [t for t in timers_raw if as_id(t.get("userId")) in (None, uid)]
+
+    field = sort_field_of(args)
+    assigned, ainc = with_task_include(lambda inc: c.get_all("/projects/api/v3/tasks.json", {
+        "responsiblePartyIds": str(uid),
+        "includeCompletedTasks": "false",
+        "include": inc,
+        "orderBy": "duedate",
+    }, "tasks", MAX_TASKS, 100), field)
+
+    # Widen by a day each side: the API filters by its own idea of the date;
+    # entries are bucketed here by their local date.
+    entries, einc = c.get_all("/projects/api/v3/time.json", {
+        "startDate": (week_start - dt.timedelta(days=1)).isoformat(),
+        "endDate": (week_days[-1] + dt.timedelta(days=1)).isoformat(),
+        "assignedToUserIds": str(uid),
+        "include": RELATED_INCLUDE,
+    }, "timelogs", MAX_ENTRIES, 250)
+
+    day_totals = {d: 0 for d in week_days}
+    task_today, task_week = {}, {}
+    for e in entries:
+        if e.get("deleted") is True or as_id(e.get("userId")) not in (None, uid):
+            continue
+        when = parse_time(e.get("timeLogged"))
+        if when is None:
+            continue
+        d = when.astimezone().date()
+        if d not in day_totals:
+            continue
+        secs = as_nonneg_int(e.get("minutes"), 24 * 60) * 60
+        day_totals[d] += secs
+        tid = rel_id(e, "task")
+        if tid is not None:
+            task_week[tid] = task_week.get(tid, 0) + secs
+            if d == today:
+                task_today[tid] = task_today.get(tid, 0) + secs
+
+    timers = [format_timer(t, tinc, now) for t in timers_raw]
+
+    tasks = {}
+    for t in assigned:
+        f = format_task(c.site, t, ainc, sort_field=field)
+        if f["id"] is not None and f["id"] not in tasks:
+            tasks[f["id"]] = f
+
+    recent_ids = [t["taskId"] for t in timers if t["taskId"] is not None] + list(task_week)
+    missing = [i for i in dict.fromkeys(recent_ids) if i not in tasks][:100]
+    if missing:
+        extra, xinc = with_task_include(lambda inc: c.get_all("/projects/api/v3/tasks.json", {
+            "ids": ",".join(str(i) for i in missing),
+            "includeCompletedTasks": "true",
+            "include": inc,
+        }, "tasks", len(missing), 100), field)
+        for t in extra:
+            f = format_task(c.site, t, xinc, sort_field=field)
+            if f["id"] in missing and f["id"] not in tasks:
+                tasks[f["id"]] = f
+    # Anything still missing (e.g. not listable): build it from the sideloads.
+    related = Included()
+    related.merge(einc.data)
+    related.merge(tinc.data)
+    entry_projects = {rel_id(e, "task"): rel_id(e, "project") for e in entries}
+    for tid in dict.fromkeys(recent_ids):
+        if tid in tasks:
+            continue
+        f = format_task(c.site, dict(related.get("tasks", tid), id=tid), related)
+        tm = next((x for x in timers if x["taskId"] == tid), None)
+        if f["projectId"] is None:
+            f["projectId"] = tm["projectId"] if tm else entry_projects.get(tid)
+            f["projectName"] = text(related.get("projects", f["projectId"]).get("name"))
+        if not f["projectName"] and tm:
+            f["projectName"] = tm["projectName"]
+        if not f["name"] and tm:
+            f["name"] = tm["taskName"]
+        tasks[tid] = f
+
+    recent_set = set(recent_ids)
+    for tid, f in tasks.items():
+        f["trackedTodaySeconds"] = task_today.get(tid, 0)
+        f["trackedWeekSeconds"] = task_week.get(tid, 0)
+        f["recent"] = tid in recent_set
+    for tm in sorted(timers, key=lambda x: (not x["running"],)):
+        f = tasks.get(tm["taskId"])
+        if f is not None and f["timerId"] is None:
+            f["timerId"] = tm["id"]
+            f["timerRunning"] = tm["running"]
+
+    def sort_key(f):
+        rank = 0 if f["timerRunning"] else (1 if f["timerId"] is not None else 2)
+        return (rank, f["dueDate"] or "9999-12-31", f["name"].casefold(), f["id"])
+
+    task_list = sorted(tasks.values(), key=sort_key)[:MAX_TASKS]
+    # Running timer first, then the most recently started.
+    timers.sort(key=lambda x: (not x["running"], -last_started_ts(x["lastStartedAt"])))
+
+    return {
+        "ok": True,
+        "user": me,
+        "timers": timers,
+        "tasks": task_list,
+        "today": {"date": today.isoformat(), "loggedSeconds": day_totals[today]},
+        "week": {
+            "start": week_start.isoformat(),
+            "loggedSeconds": sum(day_totals.values()),
+            "days": [{"date": d.isoformat(), "loggedSeconds": day_totals[d]} for d in week_days],
+        },
+        "fetchedAt": iso_utc(now),
+    }
+
+
+def _timer_response(c, data, now, fallback=None):
+    t = obj(data.get("timer"))
+    if as_id(t.get("id")) is None:
+        raise TWError("Teamwork sent an unexpected timer response", "api")
+    inc = Included()
+    inc.merge(data.get("included"))
+    return format_timer(t, inc, now, fallback)
+
+
+def cmd_start(args):
+    c = need_client(args)
+    now = now_utc()
+    timers, tinc = list_my_timers(c)
+    mine = [t for t in timers if rel_id(t, "task") == args.task_id]
+    if mine:
+        running = [t for t in mine if t.get("running") is True]
+        if running:
+            return {"ok": True, "timer": format_timer(running[0], tinc, now), "resumed": False}
+        latest = max(mine, key=lambda t: last_started_ts(t.get("lastStartedAt")))
+        fb = format_timer(latest, tinc, now)
+        data = c.request("PUT", "/projects/api/v3/me/timers/%d/resume.json" % as_id(latest.get("id")))
+        return {"ok": True, "timer": _timer_response(c, data, now, fb), "resumed": True}
+
+    tdata = c.request("GET", "/projects/api/v3/tasks/%d.json" % args.task_id, {"include": "projects,tasklists"})
+    task = obj(tdata.get("task"))
+    inc = Included()
+    inc.merge(tdata.get("included"))
+    pid = task_project_id(task, inc)
+    if pid is None:
+        raise TWError("Could not find the project for that task", "api")
+    fb = {"taskName": text(task.get("name")), "projectName": text(inc.get("projects", pid).get("name"))}
+
+    for t in timers:
+        if t.get("running") is True:
+            c.request("PUT", "/projects/api/v3/me/timers/%d/pause.json" % as_id(t.get("id")))
+
+    data = c.request("POST", "/projects/api/v3/me/timers.json", body={"timer": {
+        "taskId": args.task_id, "projectId": pid, "isRunning": True, "stopRunningTimers": True,
+    }})
+    return {"ok": True, "timer": _timer_response(c, data, now, fb), "resumed": False}
+
+
+def cmd_pause(args):
+    c = need_client(args)
+    data = c.request("PUT", "/projects/api/v3/me/timers/%d/pause.json" % args.timer_id)
+    return {"ok": True, "timer": _timer_response(c, data, now_utc())}
+
+
+def cmd_resume(args):
+    c = need_client(args)
+    data = c.request("PUT", "/projects/api/v3/me/timers/%d/resume.json" % args.timer_id)
+    return {"ok": True, "timer": _timer_response(c, data, now_utc())}
+
+
+def cmd_complete(args):
+    c = need_client(args)
+    if args.description is not None or args.billable is not None:
+        cur = obj(c.request("GET", "/projects/api/v3/timers/%d.json" % args.timer_id).get("timer"))
+        if as_id(cur.get("id")) is None:
+            raise TWError("Teamwork sent an unexpected timer response", "api")
+        body = {"isRunning": cur.get("running") is True}
+        for k in ("projectId", "taskId"):
+            v = rel_id(cur, k[:-2])
+            if v is not None:
+                body[k] = v
+        body["description"] = args.description if args.description is not None else text(cur.get("description"), MAX_DESCRIPTION)
+        if args.billable is not None:
+            body["isBillable"] = args.billable == "1"
+        elif isinstance(cur.get("billable"), bool):
+            body["isBillable"] = cur["billable"]
+        c.request("PUT", "/projects/api/v3/me/timers/%d.json" % args.timer_id, body={"timer": body})
+    data = c.request("PUT", "/projects/api/v3/me/timers/%d/complete.json" % args.timer_id)
+    out = {"ok": True}
+    tl = as_id(obj(data.get("timer")).get("timeLogId"))
+    if tl is not None:
+        out["timelogId"] = tl
+    return out
+
+
+def cmd_discard(args):
+    c = need_client(args)
+    c.request("DELETE", "/projects/api/v3/me/timers/%d.json" % args.timer_id)
+    return {"ok": True}
+
+
+def cmd_log(args):
+    c = need_client(args)
+    now_local = now_utc().astimezone()
+    if args.date:
+        day = args.date
+    else:
+        day = now_local.date()
+    if args.start:
+        h, m = args.start
+        start = dt.datetime(day.year, day.month, day.day, h, m).astimezone()
+        has_start = True
+    elif day == now_local.date():
+        midnight = dt.datetime(day.year, day.month, day.day).astimezone()
+        start = max(midnight, now_local - dt.timedelta(minutes=args.minutes)).replace(second=0, microsecond=0)
+        has_start = True
+    else:
+        start = dt.datetime(day.year, day.month, day.day, 9, 0).astimezone()
+        has_start = False
+    su = start.astimezone(dt.timezone.utc)
+    timelog = {
+        "taskId": args.task_id,
+        "date": su.date().isoformat(),
+        "time": su.strftime("%H:%M:%S"),
+        "isUtc": True,
+        "hasStartTime": has_start,
+        "hours": args.minutes // 60,
+        "minutes": args.minutes % 60,
+        "description": args.description or "",
+    }
+    if args.billable is not None:
+        timelog["isBillable"] = args.billable == "1"
+    data = c.request("POST", "/projects/api/v3/tasks/%d/time.json" % args.task_id, body={"timelog": timelog})
+    out = {"ok": True}
+    tl = as_id(obj(data.get("timelog")).get("id"))
+    if tl is not None:
+        out["timelogId"] = tl
+    return out
+
+
+def cmd_search(args):
+    c = need_client(args)
+    q = args.query.strip()
+    if not q:
+        raise TWError("Search text is empty", "usage")
+    field = sort_field_of(args)
+    data = with_task_include(lambda inc: c.request("GET", "/projects/api/v3/tasks.json", {
+        "searchTerm": q, "include": inc, "page": "1", "pageSize": str(MAX_SEARCH),
+    }), field)
+    batch = data.get("tasks") or []
+    if not isinstance(batch, list):
+        raise TWError("Teamwork sent an unexpected response", "api")
+    inc = Included()
+    inc.merge(data.get("included"))
+    tasks, seen = [], set()
+    for t in batch:
+        if not isinstance(t, dict):
+            continue
+        f = format_task(c.site, t, inc, sort_field=field)
+        if f["id"] is None or f["id"] in seen:
+            continue
+        seen.add(f["id"])
+        tasks.append(f)
+        if len(tasks) >= MAX_SEARCH:
+            break
+    return {"ok": True, "tasks": tasks}
+
+
+def cmd_open_url(args):
+    return {"ok": True, "url": task_url(need_site(args), args.task_id)}
+
+
+# ---------------------------------------------------------------- argument parsing
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise TWError("Invalid arguments: " + message[:200], "usage")
+
+    def exit(self, status=0, message=None):
+        raise TWError("Invalid arguments", "usage")
+
+
+def arg_id(v):
+    i = as_id(v) if v.isdigit() else None
+    if i is None:
+        raise argparse.ArgumentTypeError("expected a positive numeric id")
+    return i
+
+
+def arg_minutes(v):
+    if not v.isdigit() or len(v) > 5 or not 1 <= int(v) <= 24 * 60:
+        raise argparse.ArgumentTypeError("minutes must be 1-1440")
+    return int(v)
+
+
+def arg_date(v):
+    if not DATE_RE.match(v):
+        raise argparse.ArgumentTypeError("date must be YYYY-MM-DD")
+    try:
+        return dt.date.fromisoformat(v)
+    except ValueError:
+        raise argparse.ArgumentTypeError("date must be YYYY-MM-DD")
+
+
+def arg_hhmm(v):
+    m = HHMM_RE.match(v)
+    if not m:
+        raise argparse.ArgumentTypeError("start must be HH:MM")
+    return int(m.group(1)), int(m.group(2))
+
+
+def arg_description(v):
+    if len(v) > MAX_DESCRIPTION:
+        raise argparse.ArgumentTypeError("description is too long")
+    return v
+
+
+def arg_query(v):
+    if len(v) > 200:
+        raise argparse.ArgumentTypeError("search text is too long")
+    return v
+
+
+def arg_site(v):
+    if len(v) > 300:
+        raise argparse.ArgumentTypeError("site URL is too long")
+    return v
+
+
+def arg_sort_field(v):
+    s = " ".join(v.split())
+    if len(s) > MAX_SORT_FIELD:
+        raise argparse.ArgumentTypeError("sort field name is too long")
+    return s
+
+
+def build_parser():
+    common = Parser(add_help=False)
+    common.add_argument("--site", type=arg_site, default=argparse.SUPPRESS)
+    common.add_argument("--sort-field", type=arg_sort_field, default=argparse.SUPPRESS)
+    p = Parser(prog="teamwork", add_help=False, parents=[common])
+    sub = p.add_subparsers(dest="command", parser_class=Parser)
+    sub.required = True
+
+    def add(name, fn):
+        sp = sub.add_parser(name, add_help=False, parents=[common])
+        sp.set_defaults(fn=fn)
+        return sp
+
+    add("has-key", cmd_has_key)
+    add("set-key", cmd_set_key)
+    add("clear-key", cmd_clear_key)
+    add("status", cmd_status)
+    add("start", cmd_start).add_argument("task_id", type=arg_id)
+    add("pause", cmd_pause).add_argument("timer_id", type=arg_id)
+    add("resume", cmd_resume).add_argument("timer_id", type=arg_id)
+    sp = add("complete", cmd_complete)
+    sp.add_argument("timer_id", type=arg_id)
+    sp.add_argument("--description", type=arg_description)
+    sp.add_argument("--billable", choices=["0", "1"])
+    add("discard", cmd_discard).add_argument("timer_id", type=arg_id)
+    sp = add("log", cmd_log)
+    sp.add_argument("task_id", type=arg_id)
+    sp.add_argument("--minutes", type=arg_minutes, required=True)
+    sp.add_argument("--date", type=arg_date)
+    sp.add_argument("--start", type=arg_hhmm)
+    sp.add_argument("--description", type=arg_description)
+    sp.add_argument("--billable", choices=["0", "1"])
+    add("search", cmd_search).add_argument("query", type=arg_query)
+    add("open-url", cmd_open_url).add_argument("task_id", type=arg_id)
+    return p
+
+
+def run(argv):
+    if len(argv) > 32 or any(len(a) > 4096 for a in argv):
+        raise TWError("Too many or too long arguments", "usage")
+    args = build_parser().parse_args(argv)
+    return args.fn(args)
+
+
+def main(argv=None):
+    try:
+        result = run(sys.argv[1:] if argv is None else argv)
+    except TWError as e:
+        result = {"ok": False, "error": e.message, "code": e.code}
+    except Exception as e:  # never a traceback on stdout/stderr
+        result = {"ok": False, "error": "Unexpected error (%s)" % type(e).__name__, "code": "api"}
+    sys.stdout.write(json.dumps(result, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

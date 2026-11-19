@@ -1,0 +1,132 @@
+{
+  "schemaVersion": 1,
+  "id": "tomhayes.teamwork",
+  "name": "Teamwork",
+  "version": "1.0.0",
+  "author": "Tom Hayes",
+  "license": "MIT",
+  "homepage": "https://github.com/tomhayes/omarchy-teamwork",
+  "description": "Teamwork.com task timers in the Omarchy bar: start, pause, log and discard timers, see time accounted against your work hours, and get nudged when no timer is running.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Teamwork",
+    "description": "Running Teamwork timer with task, ticking time, today and week totals against work hours, task list, and a nag when nothing is timing.",
+    "category": "Productivity",
+    "aliases": [
+      "teamwork",
+      "timer",
+      "time tracking",
+      "timesheet"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "siteUrl": "",
+      "workDays": "1,2,3,4,5",
+      "workStart": "09:00",
+      "workEnd": "17:30",
+      "lunchStart": "12:30",
+      "lunchEnd": "13:30",
+      "nagEnabled": true,
+      "nagIntervalMin": 15,
+      "refreshIntervalSec": 60,
+      "longTimerWarnHours": 3,
+      "notifyAfterHours": true,
+      "sortField": ""
+    },
+    "schema": [
+      {
+        "key": "siteUrl",
+        "type": "string",
+        "label": "Teamwork site URL",
+        "defaultValue": "",
+        "description": "Your Teamwork address, https://<yours>.teamwork.com (https only, no path). The API key is set in the widget's own settings and kept in the keyring."
+      },
+      {
+        "key": "workDays",
+        "type": "string",
+        "label": "Work days",
+        "defaultValue": "1,2,3,4,5",
+        "description": "ISO weekday numbers, comma separated: 1 is Monday, 7 is Sunday."
+      },
+      {
+        "key": "workStart",
+        "type": "string",
+        "label": "Work starts (HH:MM)",
+        "defaultValue": "09:00"
+      },
+      {
+        "key": "workEnd",
+        "type": "string",
+        "label": "Work ends (HH:MM)",
+        "defaultValue": "17:30"
+      },
+      {
+        "key": "lunchStart",
+        "type": "string",
+        "label": "Lunch starts (HH:MM)",
+        "defaultValue": "12:30"
+      },
+      {
+        "key": "lunchEnd",
+        "type": "string",
+        "label": "Lunch ends (HH:MM)",
+        "defaultValue": "13:30"
+      },
+      {
+        "key": "nagEnabled",
+        "type": "boolean",
+        "label": "Nag when no timer is running",
+        "defaultValue": true,
+        "description": "During work hours, outside lunch, send a notification when no timer is running."
+      },
+      {
+        "key": "nagIntervalMin",
+        "type": "integer",
+        "label": "Nag interval (minutes)",
+        "min": 5,
+        "max": 120,
+        "step": 5,
+        "defaultValue": 15
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 15,
+        "max": 3600,
+        "step": 15,
+        "defaultValue": 60,
+        "description": "How often timers and time logged are fetched from Teamwork in the background."
+      },
+      {
+        "key": "longTimerWarnHours",
+        "type": "integer",
+        "label": "Warn when a timer runs longer than (hours)",
+        "min": 0,
+        "max": 24,
+        "step": 1,
+        "defaultValue": 3,
+        "description": "0 turns the warning off."
+      },
+      {
+        "key": "notifyAfterHours",
+        "type": "boolean",
+        "label": "Warn about timers running at lunch or after hours",
+        "defaultValue": true
+      },
+      {
+        "key": "sortField",
+        "type": "string",
+        "label": "Sort by custom field",
+        "defaultValue": "",
+        "description": "Name of a Teamwork task custom field (any case). Its value shows as a badge on each task, and tasks whose value starts with a number sort first, lowest first. Empty turns it off."
+      }
+    ]
+  }
+}
