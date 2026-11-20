@@ -178,3 +178,42 @@ test("with polling off the nag still fires from the last snapshot", () => {
   // With a 60 s poll the same two-hour-old snapshot is stale: no nag.
   assert.equal(M.shouldNag(Object.assign({}, s, { dataFresh: M.dataFresh(true, "", nowMs, fetchedMs, 60) })), false)
 })
+
+test("a log or discard form stays bound to the timer it was opened for", () => {
+  const a = { id: 11, taskId: 2, taskName: "Design review", projectName: "Acme", running: true, description: "notes", lastStartedAt: "2026-11-19T09:00:00Z" }
+  const b = { id: 12, taskId: 3, taskName: "Fix login", projectName: "Beta", running: false, lastStartedAt: "2026-11-19T08:00:00Z" }
+  const form = M.captureTimer(M.currentTimer([a, b]))
+  assert.deepEqual(form, { id: 11, taskId: 2, taskName: "Design review", projectName: "Acme", description: "notes" })
+  // A refresh makes another timer current: the form keeps its own.
+  const after = [Object.assign({}, a, { running: false }), Object.assign({}, b, { running: true })]
+  assert.equal(M.currentTimer(after).id, 12)
+  assert.equal(M.formStatus(after, form), "keep")
+  assert.equal(M.findTimer(after, form.id).id, 11)
+  // Renamed in Teamwork meanwhile: the captured heading stands.
+  const renamed = [Object.assign({}, a, { taskName: "Renamed" })]
+  assert.equal(M.formStatus(renamed, form), "keep")
+  assert.equal(form.taskName, "Design review")
+  // Logged or discarded elsewhere: close the form, act on nothing.
+  assert.equal(M.formStatus([b], form), "gone")
+  assert.equal(M.formStatus([], form), "gone")
+  assert.equal(M.formStatus(null, form), "gone")
+  assert.equal(M.formStatus([a], null), "none")
+  // Captured values are cleaned; nothing to capture without a timer.
+  assert.equal(M.captureTimer(null), null)
+  assert.equal(M.captureTimer({ id: "x" }), null)
+  assert.equal(M.captureTimer({ id: 5, taskName: "a\nb" }).taskName, "a b")
+  assert.equal(M.findTimer([a], 0), null)
+  assert.equal(M.findTimer([a], "11"), a)
+})
+
+test("connection state compares the bound site with the site in use", () => {
+  const site = "https://acme.teamwork.com"
+  assert.equal(M.connectionState(false, site, site), "noKey")
+  assert.equal(M.connectionState(true, site, ""), "noSite")
+  assert.equal(M.connectionState(true, site, site), "connected")
+  assert.equal(M.connectionState(true, "https://ACME.teamwork.com/", "https://acme.teamwork.com"), "connected")
+  assert.equal(M.connectionState(true, site, "https://other.teamwork.com"), "reconnect")
+  assert.equal(M.connectionState(true, null, site), "reconnect")
+  assert.equal(M.connectionState(true, "", site), "reconnect")
+  assert.equal(M.connectionState(true, "http://acme.teamwork.com", site), "reconnect")
+})

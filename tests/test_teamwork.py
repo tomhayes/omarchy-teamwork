@@ -8,6 +8,7 @@ real ~/.local/state / ~/.cache are never touched.
 """
 
 import base64
+import hashlib
 import json
 import os
 import shutil
@@ -25,6 +26,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(os.path.dirname(HERE), "bin", "teamwork")
 KEY = "twp_TestKey1234567890abcdef"
+CODES = {"auth", "network", "config", "api", "usage", "site-mismatch", "keyring-unavailable", "delete-failed"}
+
+
+def fingerprint(key):
+    return hashlib.sha256(b"tomhayes.teamwork:api-key:" + key.encode()).hexdigest()
 ME = {"person": {"id": 123, "firstName": "Alex", "lastName": "Example"}}
 
 
@@ -175,15 +181,43 @@ class Base(unittest.TestCase):
         self.assertIsInstance(data, dict)
         self.assertIn("ok", data)
         if not data["ok"]:
-            self.assertIn(data.get("code"), {"auth", "network", "config", "api", "usage"})
+            self.assertIn(data.get("code"), CODES)
             self.assertIsInstance(data.get("error"), str)
         return data
 
-    def store_key(self):
+    def store_key(self, bind=True):
+        """The key in the test key file, bound to the mock server (as set-key
+        leaves it) unless bind is False (as an install from before 1.0.1)."""
         os.makedirs(os.path.dirname(self.keyfile), mode=0o700, exist_ok=True)
         with open(self.keyfile, "w") as f:
             f.write(KEY + "\n")
         os.chmod(self.keyfile, 0o600)
+        if bind:
+            self.write_binding(self.server.url)
+
+    def write_binding(self, site, key=KEY, path=None):
+        path = path or self.binding_file
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"site": site, "key": fingerprint(key)}, f)
+        os.chmod(path, 0o600)
+
+    @property
+    def binding_file(self):
+        return os.path.join(os.path.dirname(self.keyfile), "site")
+
+    def read_binding(self, path=None):
+        path = path or self.binding_file
+        if not os.path.exists(path):
+            return None
+        with open(path) as f:
+            return json.load(f)
+
+    def put_cache(self, site, path=None):
+        path = path or os.path.join(self.tmp, "cache", "me.json")
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({site: {"id": 123, "name": "Alex Example"}}, f)
 
     def assert_error(self, data, code):
         self.assertFalse(data["ok"], data)
@@ -194,9 +228,11 @@ class Base(unittest.TestCase):
 
 class KeyTests(Base):
     def test_has_key_false_then_true(self):
-        self.assertEqual(self.run_tw("has-key", site=False), {"ok": True, "hasKey": False})
-        self.store_key()
-        self.assertEqual(self.run_tw("has-key", site=False), {"ok": True, "hasKey": True})
+        self.assertEqual(self.run_tw("has-key", site=False), {"ok": True, "hasKey": False, "boundSite": None})
+        self.store_key(bind=False)
+        self.assertEqual(self.run_tw("has-key", site=False), {"ok": True, "hasKey": True, "boundSite": None})
+        self.write_binding(self.server.url)
+        self.assertEqual(self.run_tw("has-key", site=False), {"ok": True, "hasKey": True, "boundSite": self.server.url})
 
     def test_set_key_validates_and_stores_private_file(self):
         d = self.run_tw("set-key", stdin=(KEY + "\n").encode())
@@ -869,6 +905,7 @@ class ErrorTests(Base):
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
         s.close()
+        self.write_binding("http://127.0.0.1:%d" % port)
         d = self.run_tw("status", "--site", "http://127.0.0.1:%d" % port, site=False)
         self.assert_error(d, "network")
 
@@ -941,8 +978,12 @@ class ErrorTests(Base):
 
 # ------------------------------------------------------------------ old id migration
 
-class LegacyKeyTests(Base):
-    """A key stored under the old tom.teamwork id moves to tomhayes.teamwork."""
+class FakeKeyring(Base):
+    """A fake secret-tool keyed by the service attribute, first on PATH.
+
+    FAKE_STORE_OK=0 makes store fail; FAKE_UNAVAILABLE=1 makes every call
+    fail the way secret-tool does without a Secret Service (exit 1, message
+    on stderr); FAKE_CLEAR_NOOP=<service,...> makes clear leave those be."""
 
     def setUp(self):
         super().setUp()
@@ -959,9 +1000,14 @@ argv = sys.argv[1:]
 data = sys.stdin.buffer.read() if argv[0] == "store" else b""
 with open(log, "a") as f:
     f.write(json.dumps({"argv": argv, "stdin": data.decode()}) + "\\n")
+if os.environ.get("FAKE_UNAVAILABLE") == "1":
+    sys.stderr.write("secret-tool: Could not connect: No such file or directory\\n")
+    sys.exit(1)
 attrs = [a for a in argv[1:] if not a.startswith("--")]
 service = dict(zip(attrs[::2], attrs[1::2])).get("service", "")
 path = os.path.join(vault, service)
+if argv[0] == "clear" and service in os.environ.get("FAKE_CLEAR_NOOP", "").split(","):
+    sys.exit(0)
 if argv[0] == "store":
     if os.environ.get("FAKE_STORE_OK") == "0":
         sys.exit(1)
@@ -982,6 +1028,12 @@ elif argv[0] == "clear":
         self.old_file = os.path.join(state, "tom.teamwork", "api-key")
         self.new_file = os.path.join(state, "tomhayes.teamwork", "api-key")
         self.old_cache = os.path.join(self.tmp, "xdg-cache", "tom.teamwork", "me.json")
+        self.new_binding = os.path.join(state, "tomhayes.teamwork", "site")
+        self.cache_file = os.path.join(self.tmp, "cache", "me.json")
+
+    def put_keyring(self, service, value=KEY):
+        with open(os.path.join(self.vault, service), "w") as f:
+            f.write(value)
 
     def keyring(self, service):
         p = os.path.join(self.vault, service)
@@ -1005,11 +1057,15 @@ elif argv[0] == "clear":
         with open(self.log) as f:
             return [json.loads(line) for line in f]
 
+
+class LegacyKeyTests(FakeKeyring):
+    """A key stored under the old tom.teamwork id moves to tomhayes.teamwork."""
+
     def test_old_keyring_entry_moves_to_new_service(self):
         with open(os.path.join(self.vault, "tom.teamwork"), "w") as f:
             f.write(KEY)
         self.put_old_cache()
-        self.assertEqual(self.run_tw("has-key", site=False, env=self.kenv), {"ok": True, "hasKey": True})
+        self.assertEqual(self.run_tw("has-key", site=False, env=self.kenv), {"ok": True, "hasKey": True, "boundSite": None})
         self.assertEqual(self.keyring("tomhayes.teamwork"), KEY)
         self.assertIsNone(self.keyring("tom.teamwork"))
         self.assertFalse(os.path.exists(self.new_file))
@@ -1042,13 +1098,25 @@ elif argv[0] == "clear":
         self.assertFalse(os.path.exists(self.old_file))
         self.assertTrue(self.run_tw("has-key", site=False, env=env)["hasKey"])
 
-    def test_migrated_key_is_used_for_requests(self):
+    def test_migrated_key_is_unbound_until_bind_legacy(self):
         with open(os.path.join(self.vault, "tom.teamwork"), "w") as f:
             f.write(KEY)
+        old_cache = {self.server.url: {"id": 123, "name": "Alex Example"}}
+        os.makedirs(os.path.dirname(self.old_cache))
+        with open(self.old_cache, "w") as f:
+            json.dump(old_cache, f)
         self.server.routes[("GET", v3("me/timers.json"))] = (200, page("timers", []))
         self.server.routes[("GET", v3("tasks.json"))] = (200, page("tasks", []))
         self.server.routes[("GET", v3("time.json"))] = (200, page("timelogs", []))
-        d = self.run_tw("status", env=self.kenv)
+        # Moved, but bound to nothing: refused before any request.
+        self.assert_error(self.run_tw("status", env=self.kenv), "site-mismatch")
+        self.assertEqual(self.server.requests, [])
+        self.assertEqual(self.keyring("tomhayes.teamwork"), KEY)
+        # The old cache came along as the record of the site it was used with.
+        env = dict(self.kenv, TEAMWORK_TEST_OFFICIAL_HOST="127.0.0.1")
+        d = self.run_tw("bind-legacy", env=env)
+        self.assertEqual(d["boundSite"], self.server.url, d)
+        d = self.run_tw("status", env=env)
         self.assertTrue(d["ok"], d)
         self.assertEqual(self.server.requests[0]["auth"], "Basic " + base64.b64encode((KEY + ":X").encode()).decode())
 
@@ -1086,6 +1154,306 @@ elif argv[0] == "clear":
         self.assertFalse(self.run_tw("has-key", site=False, env=env)["hasKey"])
         self.assertEqual(self.keyring("tom.teamwork"), KEY)
         self.assertFalse(os.path.exists(self.log))
+
+
+# ------------------------------------------------------------------ site binding
+
+AUTHED = [("status",), ("start", "2"), ("pause", "10"), ("resume", "10"), ("complete", "10"),
+          ("complete", "10", "--description=x", "--billable=1"), ("discard", "10"),
+          ("log", "2", "--minutes=30"), ("search", "design")]
+
+
+def load_helper():
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("teamwork_helper", SCRIPT)
+    spec = importlib.util.spec_from_loader("teamwork_helper", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+class BindingTests(Base):
+    """The key is bound to the site it was verified against; the helper
+    refuses to send it anywhere else."""
+
+    def setUp(self):
+        super().setUp()
+        self.other = MockServer()
+        self.other.routes[("GET", v3("me.json"))] = (200, ME)
+
+    def tearDown(self):
+        self.other.close()
+        super().tearDown()
+
+    def no_requests(self):
+        self.assertEqual(self.server.requests, [])
+        self.assertEqual(self.other.requests, [])
+
+    def test_set_key_binds_to_the_site_it_verified(self):
+        d = self.run_tw("set-key", stdin=KEY.encode())
+        self.assertTrue(d["ok"], d)
+        self.assertEqual(d["boundSite"], self.server.url)
+        self.assertEqual(self.read_binding(), {"site": self.server.url, "key": fingerprint(KEY)})
+        self.assertEqual(stat.S_IMODE(os.stat(self.binding_file).st_mode), 0o600)
+        with open(self.binding_file) as f:
+            self.assertNotIn(KEY, f.read())
+        self.assertEqual(self.run_tw("has-key", site=False)["boundSite"], self.server.url)
+
+    def test_set_key_binds_the_normalised_site(self):
+        d = self.run_tw("set-key", "--site", "HTTP" + self.server.url[4:] + "/", stdin=KEY.encode(), site=False)
+        self.assertTrue(d["ok"], d)
+        self.assertEqual(self.read_binding()["site"], self.server.url)
+
+    def test_other_site_is_refused_before_any_request(self):
+        self.store_key()
+        for argv in AUTHED:
+            d = self.run_tw(*argv, "--site", self.other.url, site=False)
+            self.assert_error(d, "site-mismatch")
+            self.assertIn("Reconnect", d["error"])
+        self.no_requests()
+
+    def test_unbound_key_is_refused_before_any_request(self):
+        self.store_key(bind=False)
+        for argv in AUTHED:
+            self.assert_error(self.run_tw(*argv), "site-mismatch")
+        self.no_requests()
+        self.assertEqual(self.run_tw("has-key", site=False), {"ok": True, "hasKey": True, "boundSite": None})
+
+    def test_binding_made_for_another_key_is_refused(self):
+        self.store_key(bind=False)
+        self.write_binding(self.server.url, key="twp_SomeOtherKey999")
+        self.assert_error(self.run_tw("status"), "site-mismatch")
+        self.assertIsNone(self.run_tw("has-key", site=False)["boundSite"])
+        self.no_requests()
+
+    def test_corrupt_or_unsafe_binding_is_refused(self):
+        self.store_key(bind=False)
+        bodies = [b"", b"not json", b"[]", b'{"site": 1, "key": "x"}',
+                  json.dumps({"site": "https://evil.example/path", "key": fingerprint(KEY)}).encode(),
+                  json.dumps({"site": self.server.url + "/", "key": fingerprint(KEY)}).encode(),
+                  json.dumps({"site": self.server.url}).encode(), b"x" * 5000]
+        for body in bodies:
+            with open(self.binding_file, "wb") as f:
+                f.write(body)
+            self.assert_error(self.run_tw("status"), "site-mismatch")
+        os.unlink(self.binding_file)
+        # Never through a symlink.
+        real = os.path.join(self.tmp, "binding-elsewhere")
+        self.write_binding(self.server.url, path=real)
+        os.symlink(real, self.binding_file)
+        self.assert_error(self.run_tw("status"), "site-mismatch")
+        self.no_requests()
+
+    def test_new_site_needs_set_key_which_rebinds(self):
+        self.store_key()
+        self.assert_error(self.run_tw("status", "--site", self.other.url, site=False), "site-mismatch")
+        self.no_requests()
+        d = self.run_tw("set-key", "--site", self.other.url, stdin=KEY.encode(), site=False)
+        self.assertTrue(d["ok"], d)
+        self.assertEqual(self.read_binding()["site"], self.other.url)
+        self.assertEqual(len(self.other.calls("GET", v3("me.json"))), 1)
+        # Now the first site is the other one.
+        self.assert_error(self.run_tw("pause", "10"), "site-mismatch")
+        self.assertEqual(self.server.requests, [])
+
+    def test_rejected_set_key_keeps_the_old_binding(self):
+        self.store_key()
+        self.other.routes[("GET", v3("me.json"))] = (401, {})
+        d = self.run_tw("set-key", "--site", self.other.url, stdin=b"twp_NewKey12345", site=False)
+        self.assert_error(d, "auth")
+        self.assertEqual(self.read_binding(), {"site": self.server.url, "key": fingerprint(KEY)})
+        with open(self.keyfile) as f:
+            self.assertEqual(f.read().strip(), KEY)
+
+    def test_open_url_needs_no_key(self):
+        d = self.run_tw("open-url", "5", "--site", self.other.url, site=False)
+        self.assertTrue(d["ok"], d)
+        self.no_requests()
+
+    # bind-legacy: an install from before bindings, with its key already saved.
+
+    def legacy_env(self, **kw):
+        return self.env(TEAMWORK_TEST_OFFICIAL_HOST="127.0.0.1", **kw)
+
+    def test_bind_legacy_binds_a_key_already_used_with_this_site(self):
+        self.store_key(bind=False)
+        self.put_cache(self.server.url)
+        d = self.run_tw("bind-legacy", env=self.legacy_env())
+        self.assertEqual(d, {"ok": True, "boundSite": self.server.url, "bound": True,
+                             "user": {"id": 123, "name": "Alex Example"}})
+        self.assertEqual([r["path"] for r in self.server.requests], [v3("me.json")])
+        self.assertEqual(self.read_binding(), {"site": self.server.url, "key": fingerprint(KEY)})
+        # Done once: again it's a no-op, with no request.
+        d = self.run_tw("bind-legacy", env=self.legacy_env())
+        self.assertEqual(d, {"ok": True, "boundSite": self.server.url, "bound": False})
+        self.assertEqual(len(self.server.requests), 1)
+
+    def test_bind_legacy_refuses_once_any_binding_exists(self):
+        self.store_key(bind=False)
+        self.put_cache(self.server.url)
+        self.write_binding(self.other.url)
+        self.assert_error(self.run_tw("bind-legacy", env=self.legacy_env()), "site-mismatch")
+        self.write_binding(self.server.url, key="twp_SomeOtherKey999")
+        self.assert_error(self.run_tw("bind-legacy", env=self.legacy_env()), "site-mismatch")
+        self.no_requests()
+
+    def test_bind_legacy_refuses_a_site_the_install_never_used(self):
+        self.store_key(bind=False)
+        self.put_cache(self.other.url)
+        self.assert_error(self.run_tw("bind-legacy", env=self.legacy_env()), "site-mismatch")
+        self.assertFalse(os.path.exists(self.binding_file))
+        self.no_requests()
+
+    def test_bind_legacy_refuses_a_site_that_is_not_teamworks(self):
+        self.store_key(bind=False)
+        self.put_cache(self.server.url)
+        self.assert_error(self.run_tw("bind-legacy"), "site-mismatch")
+        self.assert_error(self.run_tw("bind-legacy", env=self.env(TEAMWORK_TEST_OFFICIAL_HOST="10.0.0.1")),
+                          "site-mismatch")
+        self.no_requests()
+
+    def test_bind_legacy_rejected_key_is_not_bound(self):
+        self.store_key(bind=False)
+        self.put_cache(self.server.url)
+        self.server.routes[("GET", v3("me.json"))] = (401, {})
+        self.assert_error(self.run_tw("bind-legacy", env=self.legacy_env()), "auth")
+        self.assertFalse(os.path.exists(self.binding_file))
+
+    def test_bind_legacy_without_key(self):
+        self.put_cache(self.server.url)
+        self.assert_error(self.run_tw("bind-legacy", env=self.legacy_env()), "config")
+        self.no_requests()
+
+    def test_bind_legacy_impossible_after_clear_key(self):
+        self.store_key(bind=False)
+        self.put_cache(self.server.url)
+        self.assertEqual(self.run_tw("clear-key", site=False), {"ok": True})
+        self.store_key(bind=False)   # a copy that came back somehow
+        self.assert_error(self.run_tw("bind-legacy", env=self.legacy_env()), "site-mismatch")
+        self.no_requests()
+
+    def test_official_sites(self):
+        old = os.environ.pop("TEAMWORK_TEST_ALLOW_HTTP", None)
+        try:
+            h = load_helper()
+            for site in ("https://acme.teamwork.com", "https://acme.eu.teamwork.com", "https://cake-agency.teamwork.com"):
+                self.assertTrue(h.official_site(site), site)
+            for site in ("https://teamwork.com", "https://a.b.teamwork.com", "https://acme.teamwork.com.evil.example",
+                         "https://acmeteamwork.com", "http://acme.teamwork.com", "https://acme.teamwork.co",
+                         "https://projects.example.co.uk"):
+                self.assertFalse(h.official_site(site), site)
+        finally:
+            if old is not None:
+                os.environ["TEAMWORK_TEST_ALLOW_HTTP"] = old
+
+
+class KeyringBindingTests(FakeKeyring):
+    def test_set_key_in_keyring_binds_without_storing_the_key_in_the_binding(self):
+        d = self.run_tw("set-key", stdin=KEY.encode(), env=self.kenv)
+        self.assertEqual(d["storage"], "keyring")
+        self.assertEqual(self.read_binding(self.new_binding), {"site": self.server.url, "key": fingerprint(KEY)})
+        self.assertFalse(os.path.exists(self.new_file))
+        self.assertEqual(self.run_tw("has-key", site=False, env=self.kenv)["boundSite"], self.server.url)
+
+    def test_older_keyring_key_surfacing_is_not_covered_by_a_new_binding(self):
+        # The keyring holds an older key and refuses the new one, which goes to
+        # the file; the older key must not be sent under the new binding.
+        self.put_keyring("tomhayes.teamwork", "twp_OlderKey0000")
+        env = dict(self.kenv, FAKE_STORE_OK="0", FAKE_CLEAR_NOOP="tomhayes.teamwork")
+        d = self.run_tw("set-key", stdin=KEY.encode(), env=env)
+        self.assertEqual(d["storage"], "file", d)
+        self.server.requests.clear()
+        self.assert_error(self.run_tw("status", env=env), "site-mismatch")
+        self.assertEqual(self.server.requests, [])
+        # Without the no-op, the stale keyring copy is cleared on fallback.
+        env = dict(self.kenv, FAKE_STORE_OK="0")
+        self.run_tw("set-key", stdin=KEY.encode(), env=env)
+        self.assertIsNone(self.keyring("tomhayes.teamwork"))
+
+
+class ClearKeyTests(FakeKeyring):
+    """clear-key deletes every copy and says so only once it has checked."""
+
+    def put_everything(self):
+        self.put_keyring("tomhayes.teamwork")
+        self.put_keyring("tom.teamwork")
+        self.put_old_file()
+        os.makedirs(os.path.dirname(self.new_file), mode=0o700)
+        with open(self.new_file, "w") as f:
+            f.write(KEY + "\n")
+        self.write_binding(self.server.url, path=self.new_binding)
+        self.put_cache(self.server.url)
+
+    def test_removes_current_and_legacy_copies_binding_and_cache(self):
+        self.put_everything()
+        self.assertEqual(self.run_tw("clear-key", site=False, env=self.kenv), {"ok": True})
+        self.assertIsNone(self.keyring("tomhayes.teamwork"))
+        self.assertIsNone(self.keyring("tom.teamwork"))
+        for path in (self.old_file, self.new_file, self.new_binding, self.cache_file):
+            self.assertFalse(os.path.exists(path), path)
+        # It looked: one lookup per service after the clears.
+        argv = [c["argv"][0] + " " + c["argv"][-3] for c in self.calls()]
+        self.assertEqual(argv, ["clear tomhayes.teamwork", "clear tom.teamwork",
+                                "lookup tomhayes.teamwork", "lookup tom.teamwork"])
+        self.assertEqual(self.run_tw("has-key", site=False, env=self.kenv),
+                         {"ok": True, "hasKey": False, "boundSite": None})
+
+    def test_copy_left_in_keyring_is_delete_failed(self):
+        for stuck in ("tomhayes.teamwork", "tom.teamwork"):
+            self.put_keyring("tomhayes.teamwork")
+            self.put_keyring("tom.teamwork")
+            self.write_binding(self.server.url, path=self.new_binding)
+            self.put_cache(self.server.url)
+            env = dict(self.kenv, FAKE_CLEAR_NOOP=stuck)
+            d = self.run_tw("clear-key", site=False, env=env)
+            self.assert_error(d, "delete-failed")
+            self.assertEqual(self.keyring(stuck), KEY)
+            # The binding and the cache went first, so the copy left can't be
+            # used or rebound; retrying (here, once clear works) finishes it.
+            self.assertFalse(os.path.exists(self.new_binding))
+            self.assertFalse(os.path.exists(self.cache_file))
+            self.assert_error(self.run_tw("status", env=env), "site-mismatch")
+            self.assert_error(self.run_tw("bind-legacy", env=dict(env, TEAMWORK_TEST_OFFICIAL_HOST="127.0.0.1")),
+                              "site-mismatch")
+            self.assertEqual(self.server.requests, [])
+            self.assertEqual(self.run_tw("clear-key", site=False, env=self.kenv), {"ok": True})
+            self.assertIsNone(self.keyring(stuck))
+
+    def test_unreachable_keyring_is_keyring_unavailable(self):
+        self.put_everything()
+        env = dict(self.kenv, FAKE_UNAVAILABLE="1")
+        d = self.run_tw("clear-key", site=False, env=env)
+        self.assert_error(d, "keyring-unavailable")
+        # What could be removed was.
+        for path in (self.old_file, self.new_file, self.new_binding, self.cache_file):
+            self.assertFalse(os.path.exists(path), path)
+        self.assertEqual(self.keyring("tomhayes.teamwork"), KEY)
+        self.assertEqual(self.run_tw("clear-key", site=False, env=self.kenv), {"ok": True})
+
+    def test_file_that_cannot_be_removed_is_delete_failed(self):
+        self.put_everything()
+        d = os.path.dirname(self.new_file)
+        os.chmod(d, 0o500)
+        try:
+            self.assert_error(self.run_tw("clear-key", site=False, env=self.kenv), "delete-failed")
+            self.assertTrue(os.path.exists(self.new_file))
+        finally:
+            os.chmod(d, 0o700)
+        self.assertEqual(self.run_tw("clear-key", site=False, env=self.kenv), {"ok": True})
+
+    def test_no_secret_tool_installed_clears_the_file(self):
+        empty = os.path.join(self.tmp, "emptybin")
+        os.makedirs(empty)
+        env = dict(self.kenv, PATH=empty)
+        os.makedirs(os.path.dirname(self.new_file), mode=0o700)
+        with open(self.new_file, "w") as f:
+            f.write(KEY + "\n")
+        self.write_binding(self.server.url, path=self.new_binding)
+        self.assertTrue(self.run_tw("has-key", site=False, env=env)["hasKey"])
+        self.assertEqual(self.run_tw("clear-key", site=False, env=env), {"ok": True})
+        self.assertFalse(os.path.exists(self.new_file))
+        self.assertFalse(os.path.exists(self.new_binding))
 
 
 class SiteTests(Base):

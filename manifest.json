@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "tomhayes.teamwork",
   "name": "Teamwork",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Tom Hayes",
   "license": "MIT",
   "homepage": "https://github.com/tomhayes/omarchy-teamwork",
@@ -45,7 +45,7 @@
         "type": "string",
         "label": "Teamwork site URL",
         "defaultValue": "",
-        "description": "Your Teamwork address, https://<yours>.teamwork.com (https only, no path). The API key is set in the widget's own settings and kept in the keyring."
+        "description": "Your Teamwork address, https://<yours>.teamwork.com (https only, no path). The API key is set with Connect in the widget's own settings, kept in the keyring and bound to this site: a different site needs its own key, and the old one is never sent to it."
       },
       {
         "key": "workDays",

@@ -2,7 +2,10 @@
 """Teamwork.com timer helper for the tomhayes.teamwork Omarchy bar widget.
 
 Every invocation prints exactly one JSON object on stdout and exits 0.
-Errors: {"ok": false, "error": "<message>", "code": "auth|network|config|api|usage"}.
+Errors: {"ok": false, "error": "<message>", "code": "<code>"}, code one of
+auth, network, config, api, usage, site-mismatch (the stored key is not bound
+to --site; nothing was sent), keyring-unavailable or delete-failed (clear-key
+could not confirm every copy of the key is gone; safe to retry).
 
 Common options: --site https://<yours>.teamwork.com (required for anything that
 talks to Teamwork) and --sort-field NAME (optional: a task custom field whose
@@ -52,12 +55,26 @@ A key stored by an earlier version under the id tom.teamwork (keyring service or
 ~/.local/state/tom.teamwork/api-key) is moved to the new place the first time no
 key is found there, and the old copy deleted.
 
+Site binding: set-key records the site the key was verified against, with a
+SHA-256 fingerprint of the key, in ~/.local/state/tomhayes.teamwork/site (0600;
+not secret, never in shell.json). Every authenticated command refuses with
+code site-mismatch, before any request, unless --site is that site and the
+stored key is the one fingerprinted. A key stored before bindings existed is
+unbound and refused the same way; `bind-legacy` binds it once, without the key
+being re-entered, only when no binding file exists at all (so after set-key or
+clear-key it never applies), the site is an official <name>.teamwork.com or
+<name>.eu.teamwork.com address, and me.json in the cache shows that this
+install has already used a key with that exact site; the key is then checked
+with GET me.json there before it is bound. Anything else needs set-key again.
+
 Test hooks (environment):
-  TEAMWORK_KEY_FILE          use only this file for the key (secret-tool is not called)
+  TEAMWORK_KEY_FILE          use only this file for the key (secret-tool is not called);
+                             the site binding is kept beside it, in "site"
   TEAMWORK_CACHE_DIR         non-secret cache directory (default ~/.cache/tomhayes.teamwork)
   TEAMWORK_TEST_ALLOW_HTTP=1 allow http:// sites with a port (local mock servers), and
                              honour TEAMWORK_TEST_NOW (ISO 8601), TEAMWORK_TEST_TIMEOUT and
-                             TEAMWORK_TEST_DEADLINE (seconds)
+                             TEAMWORK_TEST_DEADLINE (seconds), and TEAMWORK_TEST_OFFICIAL_HOST
+                             (a host bind-legacy treats as an official Teamwork one)
 
 Limits: each socket operation times out after 15 s, and a whole invocation
 (every request it makes, bodies included) after 90 s, so a server that
@@ -68,6 +85,8 @@ JSON NaN/Infinity is refused.
 import argparse
 import base64
 import datetime as dt
+import hashlib
+import hmac
 import http.client
 import json
 import os
@@ -104,6 +123,9 @@ MAX_SORT_FIELD = 100
 HOST_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$", re.ASCII)
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+# Teamwork's own site addresses: <name>.teamwork.com and <name>.eu.teamwork.com.
+OFFICIAL_HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.(eu\.)?teamwork\.com$", re.ASCII)
+MAX_BINDING = 1024
 
 
 class TWError(Exception):
@@ -364,8 +386,24 @@ def valid_key(k):
     return isinstance(k, str) and 4 <= len(k) <= 256 and all(33 <= ord(c) <= 126 for c in k) and ":" not in k
 
 
+def key_fingerprint(key):
+    """A one-way fingerprint of the key, so a binding can tell which key it
+    was made for without storing the key itself."""
+    return hashlib.sha256(("%s:api-key:" % APP).encode("utf-8") + key.encode("utf-8")).hexdigest()
+
+
+def official_site(site):
+    """Whether `site` is one of Teamwork's own addresses (see bind-legacy)."""
+    host = urllib.parse.urlsplit(site).hostname or ""
+    if OFFICIAL_HOST_RE.match(host) and site.startswith("https://"):
+        return True
+    return test_mode() and bool(os.environ.get("TEAMWORK_TEST_OFFICIAL_HOST")) and \
+        host == os.environ["TEAMWORK_TEST_OFFICIAL_HOST"]
+
+
 class KeyStore:
-    """API key storage: Secret Service via secret-tool, else a 0600 file.
+    """API key storage: Secret Service via secret-tool, else a 0600 file; and
+    the site binding, a 0600 file beside the fallback key.
 
     TEAMWORK_KEY_FILE selects a file-only store (used by the tests); it also
     turns off the migration from the old tom.teamwork id."""
@@ -373,17 +411,38 @@ class KeyStore:
     def __init__(self):
         self.override = os.environ.get("TEAMWORK_KEY_FILE") or None
         self.file = self.override or os.path.join(state_dir(), "api-key")
+        self.site_file = os.path.join(os.path.dirname(self.file), "site")
         self.legacy_file = os.path.join(state_dir(LEGACY_APP), "api-key")
 
-    def _secret_tool(self, args, stdin=None):
+    def _run_secret_tool(self, args, stdin=None):
+        """(process, None), or (None, "no-keyring") when secret-tool isn't
+        there (or the file-only store is in use), or (None, "unavailable")."""
         if self.override:
-            return None
+            return None, "no-keyring"
         try:
             p = subprocess.run(["secret-tool"] + args, input=stdin, stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, timeout=10, check=False)
+                               stderr=subprocess.PIPE, timeout=10, check=False)
+        except FileNotFoundError:
+            return None, "no-keyring"
         except (OSError, subprocess.SubprocessError):
-            return None
-        return p
+            return None, "unavailable"
+        return p, None
+
+    def _secret_tool(self, args, stdin=None):
+        return self._run_secret_tool(args, stdin)[0]
+
+    def _probe(self, attrs):
+        """What the keyring holds under attrs: "present", "absent",
+        "unavailable" (it couldn't be asked) or "no-keyring".
+
+        secret-tool lookup exits 1 silently when nothing matches, and 1 with
+        a message on stderr when the Secret Service can't be reached."""
+        p, why = self._run_secret_tool(["lookup"] + attrs)
+        if p is None:
+            return why
+        if p.returncode == 0:
+            return "present"
+        return "unavailable" if p.stderr.strip() else "absent"
 
     def _read_file(self, path=None):
         try:
@@ -413,7 +472,9 @@ class KeyStore:
     def _migrate(self):
         """Move a key stored under the old tom.teamwork id to the current one.
 
-        The old copy is deleted only once the new one is stored."""
+        The old copy is deleted only once the new one is stored. The key stays
+        unbound (see bind-legacy); the old me.json cache comes along, as the
+        record of the site that key was used with."""
         if self.override:
             return None
         from_keyring = self._lookup(LEGACY_SECRET_ATTRS)
@@ -424,12 +485,16 @@ class KeyStore:
             self.save(key)
         except TWError:
             return key
+        cache_adopt_legacy()
         self._clear_legacy()
         return key
 
+    def _legacy_paths(self):
+        return [self.legacy_file, os.path.join(legacy_cache_dir(), "me.json")]
+
     def _clear_legacy(self):
         self._secret_tool(["clear"] + LEGACY_SECRET_ATTRS)
-        for path in (self.legacy_file, os.path.join(legacy_cache_dir(), "me.json")):
+        for path in self._legacy_paths():
             try:
                 os.unlink(path)
             except OSError:
@@ -451,6 +516,9 @@ class KeyStore:
             write_private(self.file, key.encode("utf-8") + b"\n")
         except OSError:
             raise TWError("Could not store the API key", "config")
+        # An older key left in the keyring would be read before the file.
+        # (Were it to survive, its fingerprint wouldn't match the binding.)
+        self._secret_tool(["clear"] + SECRET_ATTRS)
         return "file"
 
     def _remove_file(self):
@@ -461,11 +529,71 @@ class KeyStore:
         except OSError:
             raise TWError("Could not remove the stored API key file", "config")
 
+    # ------------------------------------------------------------ binding
+
+    def binding_exists(self):
+        return os.path.lexists(self.site_file)
+
+    def bound_site(self, key):
+        """The site `key` is bound to, or None (no binding, a corrupt one, or
+        one made for a different key)."""
+        if not key:
+            return None
+        try:
+            raw = read_small(self.site_file, MAX_BINDING, private=True)
+            data = parse_json(raw[:MAX_BINDING])
+        except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+            return None
+        if not isinstance(data, dict) or not isinstance(data.get("site"), str) or not isinstance(data.get("key"), str):
+            return None
+        if not hmac.compare_digest(data["key"], key_fingerprint(key)):
+            return None
+        try:
+            site = validate_site(data["site"])
+        except TWError:
+            return None
+        return site if site == data["site"] else None
+
+    def bind(self, site, key):
+        body = json.dumps({"site": site, "key": key_fingerprint(key)}) + "\n"
+        try:
+            write_private(self.site_file, body.encode("utf-8"))
+        except OSError:
+            raise TWError("The API key was checked but could not be tied to this site; try again", "config")
+
+    # ------------------------------------------------------------ removal
+
     def clear(self):
-        self._secret_tool(["clear"] + SECRET_ATTRS)
-        self._remove_file()
+        """Delete the key everywhere it may be (keyring and file, current and
+        old id) and the binding, then check that none is left.
+
+        Raises TWError delete-failed when a copy is still there and
+        keyring-unavailable when the keyring couldn't be asked; both are safe
+        to retry. The binding goes first, so a copy that survives is refused
+        by every command until a key is set again."""
+        paths = [self.site_file, self.file]
         if not self.override:
-            self._clear_legacy()
+            paths += self._legacy_paths()
+        for path in paths:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        if not self.override:
+            for d in (os.path.dirname(self.legacy_file), legacy_cache_dir()):
+                try:
+                    os.rmdir(d)
+                except OSError:
+                    pass
+        services = [SECRET_ATTRS] if self.override else [SECRET_ATTRS, LEGACY_SECRET_ATTRS]
+        for attrs in services:
+            self._secret_tool(["clear"] + attrs)
+        states = [self._probe(attrs) for attrs in services]
+        left = [p for p in paths if os.path.lexists(p)]
+        if "present" in states or left:
+            raise TWError("The API key could not be removed; it is still saved", "delete-failed")
+        if "unavailable" in states:
+            raise TWError("The keyring could not be reached, so the API key may still be saved there", "keyring-unavailable")
 
 
 # ---------------------------------------------------------------- cache (no secrets)
@@ -501,6 +629,23 @@ def cache_put_me(site, me):
         write_private(cache_path(), json.dumps(data).encode("utf-8"))
     except OSError:
         pass
+
+
+def cache_adopt_legacy():
+    """Carry the old tom.teamwork me.json entries over (see KeyStore._migrate)."""
+    try:
+        raw = read_small(os.path.join(legacy_cache_dir(), "me.json"), 65536)
+        old = parse_json(raw[:65536])
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+        return
+    for site, me in (old.items() if isinstance(old, dict) else []):
+        me = obj(me)
+        try:
+            ok = isinstance(site, str) and validate_site(site) == site
+        except TWError:
+            ok = False
+        if ok and as_id(me.get("id")) is not None and cache_get_me(site) is None:
+            cache_put_me(site, {"id": as_id(me.get("id")), "name": text(me.get("name"))})
 
 
 def cache_clear():
@@ -820,11 +965,21 @@ def sort_field_of(args):
     return getattr(args, "sort_field", None) or None
 
 
+RECONNECT = "Reconnect: enter the API key for this site"
+
+
 def need_client(args):
+    """A client for --site, only if the stored key is bound to that site.
+
+    Checked before anything is sent, so a changed site URL never receives
+    the key that was verified against another one."""
     site = need_site(args)
-    key = KeyStore().load()
+    store = KeyStore()
+    key = store.load()
     if not key:
         raise TWError("No Teamwork API key configured", "config")
+    if store.bound_site(key) != site:
+        raise TWError(RECONNECT, "site-mismatch")
     return Client(site, key)
 
 
@@ -844,7 +999,9 @@ def list_my_timers(c, extra=None):
 
 
 def cmd_has_key(args):
-    return {"ok": True, "hasKey": bool(KeyStore().load())}
+    store = KeyStore()
+    key = store.load()
+    return {"ok": True, "hasKey": bool(key), "boundSite": store.bound_site(key)}
 
 
 def cmd_set_key(args):
@@ -861,14 +1018,43 @@ def cmd_set_key(args):
     if not valid_key(key):
         raise TWError("API key has an invalid format", "usage")
     me = me_from(Client(site, key).request("GET", "/projects/api/v3/me.json"))
-    storage = KeyStore().save(key)
+    store = KeyStore()
+    storage = store.save(key)
+    # Bound to the site it was just checked against, and to this key only.
+    store.bind(site, key)
     cache_put_me(site, me)
-    return {"ok": True, "user": me, "storage": storage}
+    return {"ok": True, "user": me, "storage": storage, "boundSite": site}
+
+
+def cmd_bind_legacy(args):
+    """Bind a key stored before site bindings existed, without re-entering it.
+
+    Only when no binding file exists at all (never after set-key or
+    clear-key), only to an official Teamwork address, and only to a site the
+    cache shows this install has already used a key with; the key is checked
+    there (GET me.json) before it is bound. Otherwise: site-mismatch, and the
+    key must be entered again."""
+    site = need_site(args)
+    store = KeyStore()
+    key = store.load()
+    if not key:
+        raise TWError("No Teamwork API key configured", "config")
+    bound = store.bound_site(key)
+    if bound == site:
+        return {"ok": True, "boundSite": site, "bound": False}
+    if store.binding_exists() or not official_site(site) or cache_get_me(site) is None:
+        raise TWError(RECONNECT, "site-mismatch")
+    me = me_from(Client(site, key).request("GET", "/projects/api/v3/me.json"))
+    store.bind(site, key)
+    cache_put_me(site, me)
+    return {"ok": True, "boundSite": site, "bound": True, "user": me}
 
 
 def cmd_clear_key(args):
-    KeyStore().clear()
+    # The cache first: it is what lets bind-legacy rebind a key, and a
+    # removal that half fails must not leave a way back.
     cache_clear()
+    KeyStore().clear()
     return {"ok": True}
 
 
@@ -1242,6 +1428,7 @@ def build_parser():
     add("has-key", cmd_has_key)
     add("set-key", cmd_set_key)
     add("clear-key", cmd_clear_key)
+    add("bind-legacy", cmd_bind_legacy)
     add("status", cmd_status)
     add("start", cmd_start).add_argument("task_id", type=arg_id)
     add("pause", cmd_pause).add_argument("timer_id", type=arg_id)

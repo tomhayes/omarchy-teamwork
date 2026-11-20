@@ -160,6 +160,36 @@ function currentTimer(timers) {
   return best
 }
 
+// The timer with this id, or null.
+function findTimer(timers, timerId) {
+  var want = id(timerId)
+  var list = timers || []
+  if (!want) return null
+  for (var i = 0; i < list.length; i++) if (list[i] && list[i].id === want) return list[i]
+  return null
+}
+
+// What a log or discard form keeps of the timer it was opened for: its id
+// (which the form submits) and the names its heading shows, so a refresh
+// that changes the current timer can't retarget or retitle it.
+function captureTimer(timer) {
+  if (!timer || !id(timer.id)) return null
+  return {
+    id: id(timer.id),
+    taskId: id(timer.taskId),
+    taskName: str(timer.taskName),
+    projectName: str(timer.projectName),
+    description: str(timer.description, 1000)
+  }
+}
+
+// Whether an open form's timer is still there after the timers changed:
+// "none" (no form), "keep", or "gone" (close the form, act on nothing).
+function formStatus(timers, form) {
+  if (!form || !id(form.id)) return "none"
+  return findTimer(timers, form.id) ? "keep" : "gone"
+}
+
 function runningTimer(timers) {
   var list = timers || []
   for (var i = 0; i < list.length; i++) if (list[i].running) return list[i]
@@ -380,6 +410,16 @@ function cleanSiteUrl(value) {
   return "https://" + m[1].toLowerCase()
 }
 
+// Where the key stands for the site in use (bin/teamwork has the final say):
+// "noKey"; "noSite"; "connected" (bound to this site); "reconnect" (bound to
+// another site, or to none: an install from before bindings).
+function connectionState(hasKey, boundSite, siteUrl) {
+  if (!hasKey) return "noKey"
+  var site = cleanSiteUrl(siteUrl)
+  if (site === "") return "noSite"
+  return cleanSiteUrl(boundSite) === site ? "connected" : "reconnect"
+}
+
 function taskUrl(siteUrl, taskId) {
   var site = cleanSiteUrl(siteUrl)
   var n = id(taskId)
@@ -431,6 +471,10 @@ if (typeof module !== "undefined" && module.exports) {
     cleanSnapshot: cleanSnapshot,
     currentTimer: currentTimer,
     runningTimer: runningTimer,
+    findTimer: findTimer,
+    captureTimer: captureTimer,
+    formStatus: formStatus,
+    connectionState: connectionState,
     liveSeconds: liveSeconds,
     unloggedSeconds: unloggedSeconds,
     timersByTask: timersByTask,

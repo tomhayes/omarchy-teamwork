@@ -18,6 +18,11 @@ Column {
   readonly property string family: host ? host.fontFamily : Style.font.family
   readonly property var errors: host ? host.draftErrors : ({})
   readonly property var draftDays: host ? WorkTime.parseWorkDays(host.draft.workDays) : []
+  // Where the key stands for the site in the field, saved or not: a site
+  // other than the one the key is bound to needs its own key (Connect).
+  readonly property string draftConnection: host
+    ? Model.connectionState(host.hasKey, host.boundSite, host.draft.siteUrl !== undefined ? host.draft.siteUrl : host.siteUrl)
+    : "noKey"
 
   function tr(key) { return host ? host.tr(key) : key }
   function timeError(key) {
@@ -99,10 +104,11 @@ Column {
         anchors.right: parent.right
         textFormat: Text.PlainText
         text: !view.host || !view.host.hasKey ? view.tr("settings.keyMissing")
+          : view.draftConnection === "reconnect" ? view.tr("settings.keyReconnect")
           : view.host.keyStorage === "file" ? view.tr("settings.keySavedFile")
           : view.host.keyStorage === "keyring" ? view.tr("settings.keySaved")
           : view.tr("settings.keySavedUnknown")
-        color: view.host && view.host.hasKey ? Commons.Color.accent : view.dim
+        color: view.host && view.host.hasKey && view.draftConnection !== "reconnect" ? Commons.Color.accent : view.dim
         font.family: view.family
         font.pixelSize: Style.font.caption
       }
@@ -130,7 +136,7 @@ Column {
       Button {
         id: saveKeyButton
         anchors.verticalCenter: keyField.verticalCenter
-        text: view.tr("settings.keySave")
+        text: view.tr("settings.keyConnect")
         foreground: view.fg
         fontFamily: view.family
         fontSize: Style.font.bodySmall
@@ -162,6 +168,19 @@ Column {
       font.family: view.family
       font.pixelSize: Style.font.caption
       wrapMode: Text.WordWrap
+    }
+
+    // Removal couldn't be confirmed: try again.
+    Button {
+      visible: !!view.host && view.host.keyRemoveFailed
+      text: view.tr("settings.keyRetry")
+      foreground: view.host ? view.host.urgent : Commons.Color.urgent
+      fontFamily: view.family
+      fontSize: Style.font.bodySmall
+      bordered: true
+      enabled: !!view.host && !view.host.keyBusy
+      opacity: enabled ? 1 : 0.5
+      onClicked: view.host.clearKey()
     }
 
     HelpLine { text: view.tr("settings.keyHelp") }

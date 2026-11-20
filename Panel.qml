@@ -96,7 +96,17 @@ Panel {
   // ------------------------------------------------------------------- state
   property bool hasKey: false
   property bool keyChecked: false
-  readonly property bool configured: hasKey && siteUrl !== ""
+  // The site bin/teamwork has the key bound to ("" for none); the helper
+  // refuses to send the key anywhere else, and this only mirrors it.
+  property string boundSite: ""
+  // "noKey", "noSite", "connected" or "reconnect" (see Model.connectionState).
+  readonly property string connection: Model.connectionState(hasKey, boundSite, siteUrl)
+  readonly property bool configured: connection === "connected"
+  readonly property bool needsReconnect: connection === "reconnect"
+  // A key saved before bindings existed may be bound once, at startup, to the
+  // site the settings already had (bin/teamwork bind-legacy); never after the
+  // site, the key or its removal has been touched in this session.
+  property bool legacyBindAllowed: true
   property var snapshot: null
   property double fetchedMs: 0
   property string lastError: ""
@@ -112,6 +122,12 @@ Panel {
   property string view: "main"
   // "", "log" or "discard": the inline form under the current timer.
   property string timerForm: ""
+  // The timer that form was opened for (Model.captureTimer): it submits this
+  // id and shows these names whatever a refresh makes current meanwhile.
+  property var formTimer: null
+  property bool formSubmitting: false
+  // Why an open form was closed under the user ("" for none).
+  property string formNote: ""
   // The task whose manual-log form is open (0 for none).
   property int logTaskId: 0
   property int busy: 0
@@ -142,6 +158,7 @@ Panel {
   property string keyMessage: ""
   property bool keyMessageError: false
   property string keyStorage: ""
+  property bool keyRemoveFailed: false
 
   // --------------------------------------------------------------- derived
   readonly property var timers: snapshot ? snapshot.timers : []
@@ -149,6 +166,12 @@ Panel {
   readonly property var current: Model.currentTimer(timers)
   readonly property bool running: !!current && current.running
   readonly property int currentSeconds: Model.liveSeconds(current, fetchedMs, nowMs)
+  // What the hero shows: the form's own timer while a form is open.
+  readonly property var heroTimer: formTimer ? Model.findTimer(timers, formTimer.id) : current
+  readonly property bool heroRunning: !!heroTimer && heroTimer.running
+  // Its names: as captured when the form opened, else the current timer's.
+  readonly property var heroInfo: formTimer || current
+  readonly property int heroSeconds: Model.liveSeconds(heroTimer, fetchedMs, nowMs)
   readonly property int unlogged: Model.unloggedSeconds(timers, fetchedMs, nowMs)
   readonly property var todayWork: WorkTime.today(new Date(nowMs), workCfg)
   readonly property var weekWork: WorkTime.week(new Date(nowMs), workCfg)
@@ -203,6 +226,7 @@ Panel {
     if (code === "network") return tr("error.network")
     if (code === "config") return tr("error.config")
     if (code === "helper") return tr("error.helper")
+    if (code === "site-mismatch") return tr("error.siteMismatch")
     return tr("error.generic").arg(String(message || ""))
   }
 
@@ -240,7 +264,7 @@ Panel {
       if (p[i] && p[i] !== root && typeof p[i].receiveState === "function")
         p[i].receiveState({ snapshot: root.snapshot, fetchedMs: root.fetchedMs, lastError: root.lastError,
                             lastErrorCode: root.lastErrorCode, failures: root.failures, hasKey: root.hasKey,
-                            keyChecked: root.keyChecked, lastTask: root.lastTask })
+                            boundSite: root.boundSite, keyChecked: root.keyChecked, lastTask: root.lastTask })
     }
   }
   function receiveState(s) {
@@ -251,6 +275,7 @@ Panel {
     root.lastErrorCode = s.lastErrorCode
     root.failures = s.failures
     root.hasKey = s.hasKey
+    root.boundSite = String(s.boundSite || "")
     root.keyChecked = s.keyChecked
     if (s.lastTask) root.lastTask = s.lastTask
     root.schedulePoll()
@@ -263,9 +288,11 @@ Panel {
   }
 
   // -------------------------------------------------------------- helper
-  function helperArgs(cmd) {
+  // `site` overrides the saved site (set-key checks a site not saved yet).
+  function helperArgs(cmd, site) {
+    var s = site !== undefined ? site : root.siteUrl
     var args = [root.helper]
-    if (root.siteUrl !== "") args.push("--site", root.siteUrl)
+    if (s !== "") args.push("--site", s)
     // One argv entry, so a name starting with "-" can't be read as an option.
     if (root.sortField !== "") args.push("--sort-field=" + root.sortField)
     return args.concat(cmd)
@@ -273,9 +300,9 @@ Panel {
 
   // Runs bin/teamwork with argv `cmd` (never through a shell); `done` gets
   // the parsed result. `input` goes to its stdin, which is then closed.
-  function callHelper(cmd, done, input) {
+  function callHelper(cmd, done, input, site) {
     var call = helperCallComponent.createObject(root, {
-      command: root.helperArgs(cmd),
+      command: root.helperArgs(cmd, site),
       handler: done || null,
       input: input || ""
     })
@@ -289,17 +316,37 @@ Panel {
 
   function checkKey() {
     callHelper(["has-key"], function(res) {
-      root.keyChecked = true
       if (res.ok) {
-        var had = root.hasKey
+        var had = root.configured
         root.hasKey = res.hasKey === true
+        root.boundSite = Model.cleanSiteUrl(res.boundSite)
         if (root.lastErrorCode === "helper") { root.lastError = ""; root.lastErrorCode = "" }
-        if (root.hasKey && !had) root.refresh()
-        if (!root.hasKey) root.snapshot = null
+        if (root.needsReconnect && root.boundSite === "" && root.legacyBindAllowed) {
+          root.bindLegacy()
+          return
+        }
+        root.keyChecked = true
+        if (root.configured && !had) root.refresh()
+        if (!root.configured) root.snapshot = null
       } else {
+        root.keyChecked = true
         root.lastError = root.errorText(res.code === "usage" ? "helper" : res.code, res.error)
         root.lastErrorCode = res.code
       }
+      root.shareState()
+    })
+  }
+
+  // An unbound key from an earlier version, and the site the settings
+  // already had: bin/teamwork binds them only if that's a Teamwork address
+  // this install has used the key with, checking the key there first.
+  // Otherwise the key stays unbound and Settings asks to reconnect.
+  function bindLegacy() {
+    root.legacyBindAllowed = false
+    callHelper(["bind-legacy"], function(res) {
+      root.keyChecked = true
+      if (res.ok) root.boundSite = Model.cleanSiteUrl(res.boundSite)
+      if (!root.configured) root.snapshot = null
       root.shareState()
     })
   }
@@ -335,6 +382,11 @@ Panel {
       } else if (res.code === "config" && /key/i.test(res.error)) {
         // The key went missing (cleared elsewhere): back to not configured.
         root.hasKey = false
+        root.snapshot = null
+        root.lastError = ""
+      } else if (res.code === "site-mismatch") {
+        // Not bound to this site (changed elsewhere): nothing was sent.
+        root.boundSite = ""
         root.snapshot = null
         root.lastError = ""
       } else {
@@ -396,22 +448,23 @@ Panel {
     root.shareState()
   }
 
-  function actionDone(res, onOk) {
+  function actionDone(res, onOk, onFail) {
     root.busy = Math.max(0, root.busy - 1)
     if (res.ok) {
       root.actionError = ""
       if (onOk) onOk(res)
     } else {
+      if (onFail) onFail(res)
       root.actionError = root.errorText(res.code === "usage" ? "helper" : res.code, res.error)
       if (!root.opened) root.notify(root.tr("notify.actionFailed"), root.actionError, [], null)
     }
     Qt.callLater(root.refresh)
   }
 
-  function runAction(cmd, onOk) {
+  function runAction(cmd, onOk, onFail) {
     root.busy = root.busy + 1
     root.actionError = ""
-    callHelper(cmd, function(res) { root.actionDone(res, onOk) })
+    callHelper(cmd, function(res) { root.actionDone(res, onOk, onFail) })
   }
 
   function startTask(taskId, name) {
@@ -433,12 +486,57 @@ Panel {
     var desc = String(description || "").trim()
     // --opt=value keeps a description that starts with "-" an argument.
     if (desc !== "") cmd.push("--description=" + desc)
-    runAction(cmd, function() { root.removeTimer(timerId); root.timerForm = "" })
+    runAction(cmd, function() { root.formDone(timerId) }, root.formFailed)
   }
   function discardTimer(timerId) {
     if (!(timerId > 0)) return
-    runAction(["discard", String(timerId)], function() { root.removeTimer(timerId); root.timerForm = "" })
+    runAction(["discard", String(timerId)], function() { root.formDone(timerId) }, root.formFailed)
   }
+
+  // ------------------------------------------------------- log/discard form
+  // Opened for the current timer and bound to it: the id and heading are
+  // captured now, and a refresh can't swap in another timer.
+  function openTimerForm(kind) {
+    var t = Model.captureTimer(root.current)
+    if (!t) return
+    root.formTimer = t
+    root.formSubmitting = false
+    root.formNote = ""
+    root.timerForm = kind
+  }
+  function closeTimerForm() {
+    root.timerForm = ""
+    root.formTimer = null
+    root.formSubmitting = false
+  }
+  function submitTimerForm(description) {
+    if (!root.formTimer || root.busy > 0) return
+    var timerId = root.formTimer.id
+    root.formSubmitting = true
+    if (root.timerForm === "log") root.completeTimer(timerId, description)
+    else if (root.timerForm === "discard") root.discardTimer(timerId)
+    else root.formSubmitting = false
+  }
+  function formDone(timerId) {
+    // Closed first, so the timer leaving the snapshot isn't taken for one
+    // that vanished under the form.
+    if (root.formTimer && root.formTimer.id === timerId) root.closeTimerForm()
+    root.removeTimer(timerId)
+  }
+  function formFailed() {
+    root.formSubmitting = false
+    root.checkFormTimer()
+  }
+  // After the timers change: a form whose timer is gone (logged, discarded
+  // or deleted elsewhere) closes with a note instead of acting on another.
+  function checkFormTimer() {
+    if (root.timerForm === "" || root.formSubmitting) return
+    if (Model.formStatus(root.timers, root.formTimer) === "gone") {
+      root.closeTimerForm()
+      root.formNote = root.tr("form.timerGone")
+    }
+  }
+  onTimersChanged: checkFormTimer()
   function logTime(taskId, minutes, description) {
     var mins = Math.round(Number(minutes))
     if (!(taskId > 0) || !(mins >= 1 && mins <= 1440)) return false
@@ -629,6 +727,7 @@ Panel {
     root.draft = v
     root.settingsMessage = ""
     root.keyMessage = ""
+    root.keyRemoveFailed = false
   }
   function setDraft(key, value) {
     var next = Object.assign({}, root.draft)
@@ -679,31 +778,46 @@ Panel {
       root.settingsMessageError = false
       return
     }
-    var api = root.bar ? root.bar.shell : null
-    if (!api || typeof api.updateEntryInline !== "function") {
-      root.settingsMessage = root.tr("settings.saveFailed")
-      root.settingsMessageError = true
-      return
-    }
-    var entry = {}
-    for (var k in root.settings) if (k !== "id") entry[k] = root.settings[k]
     var values = root.normalizedDraft()
-    for (var key in values) entry[key] = values[key]
-    api.updateEntryInline(root.moduleName, entry)
+    // A new site is never sent the key bound to the old one: until a key is
+    // connected for it, Settings asks to reconnect and nothing polls.
+    if (values.siteUrl !== root.siteUrl) root.legacyBindAllowed = false
+    if (!root.writeEntry(values)) return
     root.settingsMessage = root.tr("settings.saved")
     root.settingsMessageError = false
     Qt.callLater(root.refresh)
   }
 
-  // The key goes to the helper's stdin and nowhere else.
+  // Merges `values` into this widget's shell.json entry. false (with the
+  // message shown) when the shell can't take it.
+  function writeEntry(values) {
+    var api = root.bar ? root.bar.shell : null
+    if (!api || typeof api.updateEntryInline !== "function") {
+      root.settingsMessage = root.tr("settings.saveFailed")
+      root.settingsMessageError = true
+      return false
+    }
+    var entry = {}
+    for (var k in root.settings) if (k !== "id") entry[k] = root.settings[k]
+    for (var key in values) entry[key] = values[key]
+    api.updateEntryInline(root.moduleName, entry)
+    return true
+  }
+
+  // Connect: the key goes to the helper's stdin and nowhere else; the helper
+  // checks it against the site in the Site URL field (saved or not) and binds
+  // it to that site, which is then saved too. Site and key in one step.
   function saveKey(key, done) {
     var k = String(key || "").trim()
     if (k === "") return
-    if (root.siteUrl === "") {
+    var site = Model.cleanSiteUrl(root.draft.siteUrl !== undefined ? root.draft.siteUrl : root.siteUrl)
+    if (site === "") {
       root.keyMessage = root.tr("settings.keyNeedsSite")
       root.keyMessageError = true
       return
     }
+    root.legacyBindAllowed = false
+    root.keyRemoveFailed = false
     root.keyBusy = true
     root.keyMessage = root.tr("settings.keyChecking")
     root.keyMessageError = false
@@ -711,7 +825,9 @@ Panel {
       root.keyBusy = false
       if (res.ok) {
         root.hasKey = true
+        root.boundSite = Model.cleanSiteUrl(res.boundSite) || site
         root.keyChecked = true
+        if (site !== root.siteUrl) root.writeEntry({ siteUrl: site })
         root.keyStorage = String(res.storage || "") === "file" ? "file" : "keyring"
         var who = res.user && typeof res.user === "object" ? Model.truncate(String(res.user.name || ""), 60) : ""
         root.keyMessage = root.tr("settings.keyOk").arg(who)
@@ -727,28 +843,39 @@ Panel {
       }
       root.shareState()
       if (done) done(res.ok === true)
-    }, k + "\n")
+    }, k + "\n", site)
     // Drop this function's references to the key; the Process clears its own.
     k = ""
     key = ""
   }
 
+  // "API key removed" only once the helper has checked that no copy is left
+  // (keyring and file, current and old id); otherwise an error and Retry.
   function clearKey() {
+    root.legacyBindAllowed = false
     root.keyBusy = true
+    root.keyRemoveFailed = false
     callHelper(["clear-key"], function(res) {
       root.keyBusy = false
+      // Whatever else happened, the helper dropped the binding first.
+      root.boundSite = ""
+      root.snapshot = null
       if (res.ok) {
         root.hasKey = false
-        root.snapshot = null
         root.keyStorage = ""
         root.lastError = ""
         root.keyMessage = root.tr("settings.keyRemoved")
         root.keyMessageError = false
+        root.shareState()
       } else {
-        root.keyMessage = root.errorText(res.code, res.error)
+        root.keyMessage = res.code === "keyring-unavailable" ? root.tr("settings.keyRemoveUnavailable")
+          : res.code === "delete-failed" ? root.tr("settings.keyRemoveFailed")
+          : root.errorText(res.code === "usage" ? "helper" : res.code, res.error)
         root.keyMessageError = true
+        root.keyRemoveFailed = true
+        // What's left, if anything (it can't be used: it is bound to nothing).
+        root.checkKey()
       }
-      root.shareState()
     })
   }
 
@@ -776,13 +903,25 @@ Panel {
       if (!root.keyChecked) root.checkKey()
       else root.refresh()
     } else {
-      root.timerForm = ""
+      root.closeTimerForm()
+      root.formNote = ""
       root.logTaskId = 0
       if (root.view === "settings" && root.configured) root.view = "main"
     }
   }
 
-  onConfiguredChanged: if (configured) Qt.callLater(refresh)
+  // A site changed in any way (here, the stock widget settings, shell.json)
+  // once the key has been looked at rules out bind-legacy for the session.
+  onSiteUrlChanged: if (keyChecked) legacyBindAllowed = false
+
+  onConfiguredChanged: {
+    if (configured) Qt.callLater(refresh)
+    else {
+      // Not bound to this site (any more): show nothing from the old one.
+      root.snapshot = null
+      root.closeTimerForm()
+    }
+  }
 
   Timer {
     id: pollTimer
@@ -823,7 +962,7 @@ Panel {
     function toggleTimer(): string { root.toggleTimer(); return "ok" }
     function state(): string {
       return JSON.stringify({
-        configured: root.configured, keyChecked: root.keyChecked, running: root.running,
+        configured: root.configured, connection: root.connection, keyChecked: root.keyChecked, running: root.running,
         timer: root.current ? { id: root.current.id, taskId: root.current.taskId, seconds: root.currentSeconds } : null,
         tasks: root.tasks.length, phase: root.todayWork.phase, error: root.lastError,
         leader: root.isLeader(), opened: root.opened, view: root.view
@@ -969,7 +1108,7 @@ Panel {
 
       onMoveRequested: function(dx, dy) { if (dy !== 0) keyCatcher.scrollBy(dy * Style.space(56)) }
       onCloseRequested: {
-        if (root.timerForm !== "") root.timerForm = ""
+        if (root.timerForm !== "") root.closeTimerForm()
         else if (root.logTaskId !== 0) root.logTaskId = 0
         else if (root.view === "settings" && root.configured) root.view = "main"
         else root.close()
@@ -1015,10 +1154,10 @@ Panel {
               foreground: root.foreground
               fontFamily: root.fontFamily
               title: !root.configured ? root.tr("hero.title")
-                : root.current ? (root.current.taskName || ("#" + root.current.taskId))
+                : root.heroInfo ? (root.heroInfo.taskName || ("#" + root.heroInfo.taskId))
                 : root.tr("hero.noTimer")
-              meta: !root.configured ? root.tr("hero.notConfigured")
-                : root.current ? ((root.running ? "" : root.tr("hero.paused") + " · ") + root.current.projectName)
+              meta: !root.configured ? (root.needsReconnect ? root.tr("hero.reconnect") : root.tr("hero.notConfigured"))
+                : root.heroInfo ? ((root.heroRunning ? "" : root.tr("hero.paused") + " · ") + root.heroInfo.projectName)
                 : root.tr("hero.pickTask")
               iconComponent: Component {
                 Text {
@@ -1031,10 +1170,10 @@ Panel {
               }
               trailingControl: Component {
                 Text {
-                  visible: !!root.current
+                  visible: !!root.heroTimer
                   textFormat: Text.PlainText
-                  text: root.hms(root.currentSeconds)
-                  color: root.running ? root.accent : root.dim
+                  text: root.hms(root.heroSeconds)
+                  color: root.heroRunning ? root.accent : root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.displayLarge
                   font.bold: true
@@ -1046,7 +1185,7 @@ Panel {
               visible: !root.configured
               width: parent.width
               textFormat: Text.PlainText
-              text: root.tr("hero.notConfiguredDetail")
+              text: root.needsReconnect ? root.tr("hero.reconnectDetail") : root.tr("hero.notConfiguredDetail")
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
@@ -1093,7 +1232,7 @@ Panel {
                   fontFamily: root.fontFamily
                   fontSize: Style.font.bodySmall
                   bordered: true
-                  onClicked: root.timerForm = "log"
+                  onClicked: root.openTimerForm("log")
                 }
                 Button {
                   text: root.tr("action.discard")
@@ -1102,7 +1241,7 @@ Panel {
                   fontFamily: root.fontFamily
                   fontSize: Style.font.bodySmall
                   bordered: true
-                  onClicked: root.timerForm = "discard"
+                  onClicked: root.openTimerForm("discard")
                 }
               }
 
@@ -1121,12 +1260,12 @@ Panel {
             // Log it: optional description, then complete.
             Column {
               id: logForm
-              visible: root.configured && !!root.current && root.timerForm === "log"
+              visible: root.configured && !!root.formTimer && root.timerForm === "log"
               width: parent.width
               spacing: Style.space(8)
 
               onVisibleChanged: if (visible) {
-                logDescription.text = root.current ? root.current.description : ""
+                logDescription.text = root.formTimer ? root.formTimer.description : ""
                 Qt.callLater(function() { logDescription.forceActiveFocus() })
               }
 
@@ -1137,9 +1276,9 @@ Panel {
                 foreground: root.foreground
                 font.family: root.fontFamily
                 maximumLength: 1000
-                Keys.onReturnPressed: if (root.current) root.completeTimer(root.current.id, text)
-                Keys.onEnterPressed: if (root.current) root.completeTimer(root.current.id, text)
-                Keys.onEscapePressed: { root.timerForm = ""; root.focusPanel() }
+                Keys.onReturnPressed: root.submitTimerForm(text)
+                Keys.onEnterPressed: root.submitTimerForm(text)
+                Keys.onEscapePressed: { root.closeTimerForm(); root.focusPanel() }
               }
 
               Row {
@@ -1150,7 +1289,7 @@ Panel {
                   foreground: root.foreground
                   fontFamily: root.fontFamily
                   fontSize: Style.font.bodySmall
-                  onClicked: { root.timerForm = ""; root.focusPanel() }
+                  onClicked: { root.closeTimerForm(); root.focusPanel() }
                 }
                 Button {
                   text: root.tr("action.confirmLog")
@@ -1161,14 +1300,14 @@ Panel {
                   bordered: true
                   enabled: root.busy === 0
                   opacity: enabled ? 1 : 0.5
-                  onClicked: if (root.current) root.completeTimer(root.current.id, logDescription.text)
+                  onClicked: root.submitTimerForm(logDescription.text)
                 }
               }
             }
 
             // Discard: confirm first.
             Column {
-              visible: root.configured && !!root.current && root.timerForm === "discard"
+              visible: root.configured && !!root.formTimer && root.timerForm === "discard"
               width: parent.width
               spacing: Style.space(8)
 
@@ -1190,7 +1329,7 @@ Panel {
                   foreground: root.foreground
                   fontFamily: root.fontFamily
                   fontSize: Style.font.bodySmall
-                  onClicked: root.timerForm = ""
+                  onClicked: root.closeTimerForm()
                 }
                 Button {
                   text: root.tr("action.confirmDiscard")
@@ -1201,7 +1340,7 @@ Panel {
                   bordered: true
                   enabled: root.busy === 0
                   opacity: enabled ? 1 : 0.5
-                  onClicked: if (root.current) root.discardTimer(root.current.id)
+                  onClicked: root.submitTimerForm("")
                 }
               }
             }
@@ -1218,6 +1357,17 @@ Panel {
               bordered: true
               enabled: root.busy === 0
               onClicked: root.toggleTimer()
+            }
+
+            Text {
+              visible: root.formNote !== "" && root.timerForm === ""
+              width: parent.width
+              textFormat: Text.PlainText
+              text: root.formNote
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
             }
 
             Text {
